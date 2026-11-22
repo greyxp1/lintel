@@ -107,8 +107,7 @@ def read_browser_session(command, environment):
         process = subprocess.Popen(
             [
                 "sh", "-c", f'exec {redirections}; exec "$@"', "lintel-login",
-                *command, "--restore-last-session", "--remote-debugging-pipe",
-                "--new-window", ORIGIN + "/",
+                *command, "--headless", "--remote-debugging-pipe", ORIGIN + "/",
             ],
             env=environment, pass_fds=(fd,), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
