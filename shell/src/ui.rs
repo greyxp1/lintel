@@ -395,8 +395,13 @@ impl Model {
     self.signed_in = true;
     self.library_checked = true;
     self.reconnect = false;
-    self.playlists = pinned.to_vec();
-    for playlist in playlists {
+    let visible = |list: &Playlist| list.id.trim_start_matches("VL") != "SE";
+    self.playlists = pinned
+      .iter()
+      .filter(|list| visible(list))
+      .cloned()
+      .collect();
+    for playlist in playlists.into_iter().filter(visible) {
       if let Some(pin) = self.playlists.iter_mut().find(|pin| pin.id == playlist.id) {
         pin.art = playlist.art;
       } else {
