@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1172,6 +1173,20 @@ fn text_layout(cr: &Context, text: &str, size: i32, weight: Weight) -> pango::La
   layout
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct LabelKey {
+  text: String,
+  size: i32,
+  weight: Weight,
+  width: i32,
+  align: Alignment,
+  scale: u64,
+}
+
+thread_local! {
+  static LABEL_LAYOUTS: RefCell<HashMap<LabelKey, pango::Layout>> = RefCell::default();
+}
+
 fn label(
   cr: &Context,
   text: &str,
@@ -1181,17 +1196,48 @@ fn label(
   align: Alignment,
 ) {
   let (x, y, width) = rect;
-  let layout = text_layout(cr, text, size, weight);
-  let x = if width == 0 {
-    f64::from(x) - f64::from(layout.pixel_size().0) / 2.0
-  } else {
-    layout.set_width(width * SCALE);
-    layout.set_ellipsize(EllipsizeMode::End);
-    layout.set_alignment(align);
-    f64::from(x)
+  let create = || {
+    let layout = text_layout(cr, text, size, weight);
+    if width != 0 {
+      layout.set_width(width * SCALE);
+      layout.set_ellipsize(EllipsizeMode::End);
+      layout.set_alignment(align);
+    }
+    layout
   };
-  cr.move_to(x, f64::from(y));
-  pangocairo::functions::show_layout(cr, &layout);
+  let paint = |layout: &pango::Layout| {
+    let mut x = f64::from(x);
+    if width == 0 {
+      x -= f64::from(layout.pixel_size().0) / 2.0;
+    }
+    cr.move_to(x, f64::from(y));
+    pangocairo::functions::show_layout(cr, layout);
+  };
+  if text.len() > 1024 {
+    paint(&create());
+    return;
+  }
+  // Lintel paints with a uniform output scale and optional translation.
+  let key = LabelKey {
+    text: text.into(),
+    size,
+    weight,
+    width,
+    align,
+    scale: cr.matrix().xx().to_bits(),
+  };
+  LABEL_LAYOUTS.with_borrow_mut(|layouts| {
+    if let Some(layout) = layouts.get(&key) {
+      paint(layout);
+    } else {
+      if layouts.len() == 256 {
+        layouts.clear();
+      }
+      let layout = create();
+      paint(&layout);
+      layouts.insert(key, layout);
+    }
+  });
 }
 
 fn picture(
