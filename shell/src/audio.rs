@@ -1,10 +1,9 @@
-use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
 use std::time::Duration;
+use std::{io, thread};
 
 use serde_json::Value;
 
@@ -379,15 +378,24 @@ pub fn route_worker() -> (
       }
       if let Some(revision) = active {
         match sync_links(&mut links) {
-          Ok(ready) => {
-            if retry == 12 {
-              let _ = report.try_send(RouteStatus {
-                enabled: true,
-                revision,
-                error: None,
-              });
-            }
-            retry = if ready { 0 } else { retry.saturating_sub(1) };
+          Ok(true) => {
+            let _ = report.try_send(RouteStatus {
+              enabled: true,
+              revision,
+              error: None,
+            });
+            retry = 0;
+          }
+          Ok(false) if retry > 1 => retry -= 1,
+          Ok(false) => {
+            links.clear();
+            active = None;
+            retry = 0;
+            let _ = report.try_send(RouteStatus {
+              enabled: false,
+              revision,
+              error: Some("Music microphone ports did not connect".into()),
+            });
           }
           Err(error) => {
             links.clear();
