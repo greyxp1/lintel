@@ -38,6 +38,11 @@ const SAVE_WIDTH: i32 = 55;
 const SAVE_X: i32 = PLAYER_X - SAVE_WIDTH - 12;
 const LIST_Y: i32 = PANEL_Y + 60;
 const TAB_END: i32 = TRANSPORT_END;
+const LYRICS_SHIFT: i32 = 174;
+const LYRICS_LEFT: i32 = MUSIC_LEFT + 12;
+const LYRICS_WIDTH: i32 = WIDTH - 2 * LYRICS_LEFT;
+const LYRICS_TOP: i32 = LIST_Y + 20;
+const LYRICS_BOTTOM: i32 = 447;
 const RESULTS_Y: i32 = LIST_Y + 41;
 const RESULTS_ROW: i32 = 46;
 const SEARCH_ROWS: usize = 5;
@@ -184,6 +189,15 @@ const MUSIC_TABS: [MusicTab; 4] = [
   MusicTab::Lyrics,
   MusicTab::Search,
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LyricMarker {
+  index: usize,
+  word_end: u32,
+  word_progress: u8,
+  scroll_progress: u8,
+  singing: bool,
+}
 
 struct PlaylistTarget {
   song: Song,
@@ -470,7 +484,11 @@ impl Model {
     for (index, hover) in self.audio_hover.iter_mut().enumerate() {
       let active = match self.panel {
         Panel::Audio => audio_button_hit(pointer, index),
-        Panel::Music if self.signed_in && self.confirmation.is_none() => {
+        Panel::Music
+          if self.signed_in
+            && self.music_tab != MusicTab::Lyrics
+            && self.confirmation.is_none() =>
+        {
           if index == MusicChannel::Listen as usize {
             music_headphones_hit(pointer)
           } else {
@@ -532,9 +550,16 @@ impl Model {
       .map_or_else(|| self.track.elapsed(), |(_, pos)| *pos)
   }
 
-  pub fn lyric_marker(&self) -> Option<(usize, u32, bool)> {
-    if !self.wide_music()
-      || self.music_tab != MusicTab::Lyrics
+  pub fn lyrics_view(&self) -> bool {
+    self.wide_music() && self.music_tab == MusicTab::Lyrics
+  }
+
+  fn player_shift(&self) -> i32 {
+    if self.lyrics_view() { LYRICS_SHIFT } else { 0 }
+  }
+
+  pub fn lyric_marker(&self) -> Option<LyricMarker> {
+    if !self.lyrics_view()
       || self.lyrics_id != self.track.id
       || self.lyrics.lines.first()?.start.is_none()
     {
@@ -545,17 +570,45 @@ impl Model {
     let started = lines.partition_point(|line| line.start.is_some_and(|start| start <= elapsed));
     let index = started.saturating_sub(1);
     let line = &lines[index];
-    let end = line
+    let word = line
       .words
       .iter()
       .take_while(|word| word.start <= elapsed)
-      .last()
-      .map_or(0, |word| word.end_byte);
-    Some((
+      .last();
+    let progress = word.map_or(0, |word| {
+      let span = word.end.unwrap_or(word.start) - word.start;
+      if span <= 0.0 {
+        16
+      } else {
+        ((elapsed - word.start) / span * 16.0).clamp(0.0, 16.0) as u8
+      }
+    });
+    let scroll_progress = if !self.lyrics_scrolled && self.track.progressing_since.is_some() {
+      line.start.map_or(16, |start| {
+        (((elapsed - start) / 0.28) * 16.0).clamp(0.0, 16.0) as u8
+      })
+    } else {
+      16
+    };
+    Some(LyricMarker {
       index,
-      end,
-      started > 0 && line.end.is_none_or(|end| elapsed <= end),
-    ))
+      word_end: word.map_or(0, |word| word.end_byte),
+      word_progress: progress,
+      scroll_progress,
+      singing: started > 0 && line.end.is_none_or(|end| elapsed <= end),
+    })
+  }
+
+  pub fn animated_lyric_marker(&self) -> Option<LyricMarker> {
+    let marker = self.lyric_marker()?;
+    let start = self.lyrics.lines[marker.index].start?;
+    (!self.lyrics_scrolled
+      || self
+        .lyric_hits
+        .borrow()
+        .iter()
+        .any(|&(_, _, time)| time == start))
+    .then_some(marker)
   }
 
   fn music_stream(&self) -> Option<&Stream> {
@@ -644,8 +697,18 @@ impl Model {
     }
   }
 
-  pub fn scroll(&mut self, amount: f64, x: i32, _y: i32) {
-    if self.panel == Panel::Music && !(MUSIC_LEFT - 6..PLAYER_X).contains(&x) {
+  pub fn scroll(&mut self, amount: f64, x: i32, y: i32) {
+    if self.lyrics_view() && !(LYRICS_TOP..LYRICS_BOTTOM).contains(&y) {
+      return;
+    }
+    if self.panel == Panel::Music
+      && !(MUSIC_LEFT - 6..if self.lyrics_view() {
+        WIDTH - MUSIC_LEFT
+      } else {
+        PLAYER_X
+      })
+        .contains(&x)
+    {
       return;
     }
     if matches!(
@@ -655,9 +718,15 @@ impl Model {
       if self.wide_music()
         && self.music_tab == MusicTab::Lyrics
         && !self.lyrics_scrolled
-        && let Some((index, _, _)) = self.lyric_marker()
+        && let Some(marker) = self.lyric_marker()
       {
-        self.offset = index.saturating_sub(1);
+        let anchor = marker.index.saturating_sub(1);
+        if (amount < 0.0 && marker.index == 0)
+          || (amount > 0.0 && anchor + 1 >= self.lyrics.lines.len())
+        {
+          return;
+        }
+        self.offset = anchor;
         self.lyrics_scrolled = true;
       }
       let offset = if amount > 0.0 {
@@ -805,7 +874,7 @@ impl Model {
             0
           }
       }
-      Panel::Music => TRANSPORT_END + 16,
+      Panel::Music => TRANSPORT_END + 16 + self.player_shift(),
       Panel::Audio => {
         let count = self.count().min(VISIBLE_ROWS) as i32;
         PANEL_Y
@@ -833,7 +902,11 @@ impl Model {
 
   fn confirmation_geometry(&self) -> (i32, i32, i32) {
     if self.signed_in {
-      (PLAYER_X + 6, PANEL_Y + SEEK_Y - 2, PLAYER_WIDTH - 16)
+      (
+        PLAYER_X + 6,
+        PANEL_Y + SEEK_Y - 2 + self.player_shift(),
+        PLAYER_WIDTH - 16,
+      )
     } else {
       (SIGN_IN_X, SIGN_IN_Y - 1, SIGN_IN_WIDTH)
     }
@@ -1026,6 +1099,34 @@ impl Model {
     Some(Action::MusicTab(tab))
   }
 
+  pub fn scroll_focused_panel(&mut self, down: bool) -> bool {
+    if self.panel == Panel::None || self.confirmation.is_some() {
+      return false;
+    }
+    let previous = (self.offset, self.search_row, self.lyrics_scrolled);
+    if !self.move_search_focus(down) {
+      self.scroll(if down { 1.0 } else { -1.0 }, MUSIC_LEFT, LYRICS_TOP);
+    }
+    previous != (self.offset, self.search_row, self.lyrics_scrolled)
+  }
+
+  pub fn follow_lyrics(&mut self) -> bool {
+    if !self.lyrics_view() {
+      return false;
+    }
+    self.reset_music_scroll();
+    true
+  }
+
+  pub fn toggle_from_lyrics(&self) -> Option<Action> {
+    (self.lyrics_view() && self.track.has_track && self.confirmation.is_none()).then_some(
+      Action::Media {
+        command: "toggle",
+        rewind: self.track.at_end,
+      },
+    )
+  }
+
   pub fn move_search_focus(&mut self, down: bool) -> bool {
     if !self.wide_music() || self.music_tab != MusicTab::Search || self.confirmation.is_some() {
       return false;
@@ -1213,17 +1314,26 @@ impl Model {
         }
         return None;
       }
-      if self.signed_in && self.music_mix && !right && music_mic_hit(Some((x.into(), y.into()))) {
+      if self.signed_in
+        && !self.lyrics_view()
+        && self.music_mix
+        && !right
+        && music_mic_hit(Some((x.into(), y.into())))
+      {
         return Some(Action::ToggleMic);
       }
       if self.signed_in
+        && !self.lyrics_view()
         && !right
         && music_headphones_hit(Some((x.into(), y.into())))
         && let Some((slider, _)) = self.music_slider(MusicChannel::Listen)
       {
         return Some(Action::Volume(slider, None));
       }
-      if self.signed_in && (MUSIC_GAIN_TOP - 8..=MUSIC_GAIN_BOTTOM + 8).contains(&y) {
+      if self.signed_in
+        && !self.lyrics_view()
+        && (MUSIC_GAIN_TOP - 8..=MUSIC_GAIN_BOTTOM + 8).contains(&y)
+      {
         for channel in MusicChannel::ALL {
           if (x - music_gain_x(channel)).abs() <= 12
             && let Some((slider, _)) = self.music_slider(channel)
@@ -1262,7 +1372,8 @@ impl Model {
         return (!self.library_refreshing && !self.playlist_busy && self.sign_in_hit(x, y))
           .then_some(Action::SignIn);
       }
-      if !self.playlist_busy
+      if !self.lyrics_view()
+        && !self.playlist_busy
         && inside(
           Some((f64::from(x), f64::from(y))),
           PLAYER_SIGN_OUT_X,
@@ -1278,7 +1389,7 @@ impl Model {
         && inside(
           Some((x.into(), y.into())),
           PLAYER_REMOVE_X,
-          PANEL_Y + TRANSPORT_Y,
+          PANEL_Y + TRANSPORT_Y + self.player_shift(),
           TAB_WIDTH,
           27,
         )
@@ -1292,7 +1403,7 @@ impl Model {
         });
         return None;
       }
-      let relative_y = y - PANEL_Y;
+      let relative_y = y - PANEL_Y - self.player_shift();
       let controls = x - TRANSPORT_X;
       if (TRANSPORT_Y..TRANSPORT_Y + 29).contains(&relative_y)
         && (0..3 * BUTTON_WIDTH).contains(&controls)
@@ -1315,6 +1426,25 @@ impl Model {
         && (TAB_START..TAB_START + 4 * MUSIC_TAB_WIDTH).contains(&x)
       {
         return self.music_tab_shortcut(((x - TAB_START) / MUSIC_TAB_WIDTH) as usize);
+      }
+      if self.lyrics_view() {
+        if self.lyrics_scrolled
+          && (WIDTH - LYRICS_LEFT - 76..WIDTH - LYRICS_LEFT).contains(&x)
+          && (LIST_Y - 10..LYRICS_TOP).contains(&y)
+        {
+          self.lyrics_scrolled = false;
+        } else if self.track.duration > 0.0
+          && (LYRICS_LEFT..LYRICS_LEFT + LYRICS_WIDTH).contains(&x)
+          && let Some((_, _, start)) = self
+            .lyric_hits
+            .borrow()
+            .iter()
+            .find(|(top, bottom, _)| (*top..*bottom).contains(&y))
+        {
+          self.lyrics_scrolled = false;
+          return Some(Action::Seek(start.clamp(0.0, self.track.duration)));
+        }
+        return None;
       }
       if x < PLAYER_X && (LIST_Y..TAB_END).contains(&y) {
         match self.music_tab {
@@ -1348,23 +1478,6 @@ impl Model {
                 to: index,
                 submitted: false,
               });
-            }
-          }
-          MusicTab::Lyrics => {
-            if self.lyrics_scrolled
-              && (PLAYER_X - 84..PLAYER_X - 12).contains(&x)
-              && (LIST_Y..LIST_Y + 26).contains(&y)
-            {
-              self.lyrics_scrolled = false;
-            } else if self.track.duration > 0.0
-              && let Some((_, _, start)) = self
-                .lyric_hits
-                .borrow()
-                .iter()
-                .find(|(top, bottom, _)| (*top..*bottom).contains(&y))
-            {
-              self.lyrics_scrolled = false;
-              return Some(Action::Seek(start.clamp(0.0, self.track.duration)));
             }
           }
           MusicTab::Search if self.playlist_target.is_some() => {
@@ -1830,7 +1943,7 @@ fn clock_text(seconds: f64) -> String {
 fn paint_timeline(cr: &Context, model: &Model) -> cairo::Result<()> {
   let x = PLAYER_X + 8;
   let width = PLAYER_WIDTH - 18;
-  let y = PANEL_Y + SEEK_Y;
+  let y = PANEL_Y + SEEK_Y + model.player_shift();
   let (position, duration) = if let Some((song, seconds)) = &model.starting_song {
     (*seconds, f64::from(song.seconds))
   } else {
@@ -1876,7 +1989,7 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
       && inside(
         model.bar_pointer,
         x,
-        PANEL_Y + TRANSPORT_Y,
+        PANEL_Y + TRANSPORT_Y + model.player_shift(),
         BUTTON_WIDTH,
         29,
       )
@@ -1908,7 +2021,7 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
     && inside(
       model.bar_pointer,
       PLAYER_REMOVE_X,
-      PANEL_Y + TRANSPORT_Y,
+      PANEL_Y + TRANSPORT_Y + model.player_shift(),
       TAB_WIDTH,
       27,
     )
@@ -2296,8 +2409,28 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
   Ok(())
 }
 
+thread_local! {
+  static LYRIC_LAYOUTS: RefCell<HashMap<(String, u64), pango::Layout>> = RefCell::default();
+}
+
+fn lyric_layout(cr: &Context, text: &str) -> pango::Layout {
+  LYRIC_LAYOUTS.with_borrow_mut(|cache| {
+    let key = (text.to_owned(), cr.matrix().xx().to_bits());
+    if let Some(layout) = cache.get(&key) {
+      return layout.clone();
+    }
+    if cache.len() >= 24 {
+      cache.clear();
+    }
+    let layout = text_layout(cr, text, 29, Weight::Semibold);
+    layout.set_width(LYRICS_WIDTH * SCALE);
+    layout.set_wrap(pango::WrapMode::WordChar);
+    cache.insert(key, layout.clone());
+    layout
+  })
+}
+
 fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
-  let width = PLAYER_X - MUSIC_LEFT - 14;
   let mut hits = model.lyric_hits.borrow_mut();
   hits.clear();
   if let Some(status) = &model.lyrics_status {
@@ -2305,106 +2438,144 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
     label(
       cr,
       status,
-      (MUSIC_LEFT, LIST_Y + 8, width),
-      15,
+      (LYRICS_LEFT, LYRICS_TOP + 30, LYRICS_WIDTH),
+      19,
       Weight::Normal,
       Alignment::Left,
     );
     return Ok(());
   }
   let marker = model.lyric_marker();
-  let timed = marker.is_some();
-  let mut offset = model.offset;
-  if let Some((index, _, _)) = marker {
-    if model.lyrics_scrolled {
-      let hovered = inside(model.bar_pointer, PLAYER_X - 84, LIST_Y, 72, 26);
-      round(cr, PLAYER_X - 84, LIST_Y, 72, 26, 6.0);
-      color(cr, 0xcba6f7, if hovered { 0.24 } else { 0.13 });
-      cr.fill()?;
-      color(cr, 0xcba6f7, 1.0);
-      label(
-        cr,
-        "Follow",
-        (PLAYER_X - 84, LIST_Y + 4, 72),
-        12,
-        Weight::Semibold,
-        Alignment::Center,
-      );
+  let current = marker.map(|marker| marker.index);
+  let follow = current.is_some() && !model.lyrics_scrolled;
+  let (offset, mut y) = if let Some(marker) = marker.filter(|_| follow) {
+    let anchor = LYRICS_TOP + 81;
+    if marker.index == 0 {
+      (0, anchor)
     } else {
-      offset = index.saturating_sub(1);
+      let height = |index: usize| {
+        lyric_layout(cr, &model.lyrics.lines[index].text)
+          .pixel_size()
+          .1
+          + 20
+      };
+      let previous = marker.index - 1;
+      let previous_height = height(previous);
+      let t = f64::from(marker.scroll_progress) / 16.0;
+      let remaining = 1.0 - t * t * (3.0 - 2.0 * t);
+      let y = anchor - previous_height + (remaining * f64::from(previous_height)).round() as i32;
+      if previous > 0 && marker.scroll_progress < 16 {
+        (previous - 1, y - height(previous - 1))
+      } else {
+        (previous, y)
+      }
     }
+  } else {
+    (model.offset, LYRICS_TOP)
+  };
+  if current.is_some() && !follow {
+    let x = WIDTH - LYRICS_LEFT - 76;
+    let hovered = inside(model.bar_pointer, x, LIST_Y - 10, 76, 28);
+    round(cr, x, LIST_Y - 10, 76, 28, 7.0);
+    color(cr, 0xcba6f7, if hovered { 0.24 } else { 0.13 });
+    cr.fill()?;
+    color(cr, 0xcba6f7, 1.0);
+    label(
+      cr,
+      "Follow",
+      (x, LIST_Y - 5, 76),
+      13,
+      Weight::Semibold,
+      Alignment::Center,
+    );
   }
-  let bottom = TAB_END - 22;
-  let top = LIST_Y + 34;
-  let mut y = top;
   cr.save()?;
   cr.rectangle(
-    f64::from(MUSIC_LEFT),
-    f64::from(y),
-    f64::from(width),
-    f64::from(bottom - y),
+    f64::from(LYRICS_LEFT),
+    f64::from(LYRICS_TOP),
+    f64::from(LYRICS_WIDTH),
+    f64::from(LYRICS_BOTTOM - LYRICS_TOP),
   );
   cr.clip();
   for (index, line) in model.lyrics.lines.iter().enumerate().skip(offset) {
-    if y >= bottom {
+    if y >= LYRICS_BOTTOM {
       break;
     }
-    let active = marker.filter(|&(current, _, singing)| index == current && singing);
-    let layout = text_layout(cr, &line.text, 19, Weight::Semibold);
-    layout.set_width(width * SCALE);
-    layout.set_wrap(pango::WrapMode::WordChar);
-    if let Some((_, end, _)) = active
-      && end > 0
-    {
-      let attributes = pango::AttrList::new();
-      let mut highlight = pango::AttrColor::new_foreground(0xf5f5, 0xe0e0, 0xdcdc);
-      highlight.set_end_index(end);
-      attributes.insert(highlight);
-      layout.set_attributes(Some(&attributes));
-    }
-    let height = layout.pixel_size().1 + 12;
-    if let Some((current, _, _)) = marker
-      && !model.lyrics_scrolled
-      && index + 1 == current
-    {
-      y = top + 49 - height;
-    }
-    let hovered = timed
+    let active = marker.filter(|marker| marker.index == index && marker.singing);
+    let layout = lyric_layout(cr, &line.text);
+    let attrs = active.filter(|marker| marker.word_end > 0).map(|marker| {
+      let end = marker.word_end;
+      let progress = marker.word_progress;
+      let attrs = pango::AttrList::new();
+      let previous = line
+        .words
+        .iter()
+        .take_while(|word| word.end_byte < end)
+        .last()
+        .map_or(0, |word| word.end_byte);
+      let mut sung = pango::AttrColor::new_foreground(0xffff, 0xf9f9, 0xf8f8);
+      sung.set_end_index(previous);
+      attrs.insert(sung);
+      let tint =
+        |from: u16, to: u16| from + ((u32::from(to - from) * u32::from(progress)) / 16) as u16;
+      let mut word = pango::AttrColor::new_foreground(
+        tint(0xacac, 0xffff),
+        tint(0xaaaa, 0xf9f9),
+        tint(0xc0c0, 0xf8f8),
+      );
+      word.set_start_index(previous);
+      word.set_end_index(end);
+      attrs.insert(word);
+      attrs
+    });
+    layout.set_attributes(attrs.as_ref());
+    let height = layout.pixel_size().1 + 20;
+    let hovered = current.is_some()
       && inside(
         model.bar_pointer,
-        MUSIC_LEFT,
-        y,
-        width,
-        height.min(bottom - y),
+        LYRICS_LEFT,
+        y.max(LYRICS_TOP),
+        LYRICS_WIDTH,
+        (y + height).min(LYRICS_BOTTOM) - y.max(LYRICS_TOP),
       );
-    color(
-      cr,
-      if active.is_some() {
-        0xcba6f7
-      } else if !timed || hovered {
-        0xcdd6f4
-      } else {
-        0xa6adc8
-      },
-      if timed && active.is_none() && !hovered {
-        0.80
-      } else {
-        1.0
-      },
-    );
-    cr.move_to(f64::from(MUSIC_LEFT), f64::from(y));
+    let (ink, alpha) = if active.is_some() {
+      (
+        if line.words.is_empty() {
+          0xfff9f8
+        } else {
+          0xacaac0
+        },
+        1.0,
+      )
+    } else if hovered || !follow {
+      (0xcdd6f4, 1.0)
+    } else {
+      let distance = current.unwrap_or(index).abs_diff(index).min(5) as f64;
+      (0xcdd6f4, 0.68 - distance * 0.044)
+    };
+    color(cr, ink, alpha);
+    cr.move_to(f64::from(LYRICS_LEFT), f64::from(y));
     pangocairo::functions::show_layout(cr, &layout);
-    if let Some(start) = line.start {
-      hits.push((y.max(top), (y + height).min(bottom), start));
+    if let Some(start) = line.start
+      && y + height > LYRICS_TOP
+    {
+      hits.push((y.max(LYRICS_TOP), (y + height).min(LYRICS_BOTTOM), start));
     }
     y += height;
   }
   cr.restore()?;
+  let timing = if model.lyrics.lines.iter().any(|line| !line.words.is_empty()) {
+    "Word sync"
+  } else if marker.is_some() {
+    "Line sync"
+  } else {
+    "Unsynced"
+  };
   color(cr, 0xa6adc8, 1.0);
   label(
     cr,
-    &model.lyrics.source,
-    (MUSIC_LEFT, TAB_END - 17, width),
+    &format!("{timing}  /  {}", model.lyrics.source),
+    (LYRICS_LEFT, LYRICS_BOTTOM + 8, LYRICS_WIDTH),
     11,
     Weight::Normal,
     Alignment::Left,
@@ -2653,6 +2824,69 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       }
       return Ok(());
     }
+    let (title, artist) = model.starting_song.as_ref().map_or(
+      (model.track.title.as_str(), model.track.artist.as_str()),
+      |(song, _)| (song.title.as_str(), song.artist.as_str()),
+    );
+    if model.lyrics_view() {
+      paint_music_library(cr, model, MUSIC_LEFT)?;
+      let y = LYRICS_BOTTOM + 33;
+      color(cr, 0xcdd6f4, 0.13);
+      cr.rectangle(
+        f64::from(MUSIC_LEFT),
+        f64::from(y - 9),
+        f64::from(WIDTH - 2 * MUSIC_LEFT),
+        1.0,
+      );
+      cr.fill()?;
+      picture(
+        cr,
+        model
+          .large_cover
+          .as_ref()
+          .filter(|(url, _)| url == model.cover_url())
+          .and_then(|(_, cover)| cover.as_ref()),
+        MUSIC_LEFT,
+        y + 9,
+        58,
+        "♪",
+      )?;
+      color(cr, 0xcdd6f4, 1.0);
+      label_lines(
+        cr,
+        if title.is_empty() {
+          "Nothing playing"
+        } else {
+          title
+        },
+        (MUSIC_LEFT + 72, y + 8, PLAYER_X - MUSIC_LEFT - 86),
+        15,
+        Weight::Semibold,
+        Alignment::Left,
+        2,
+      );
+      color(cr, 0xa6adc8, 1.0);
+      label(
+        cr,
+        model.music_status().unwrap_or(artist),
+        (MUSIC_LEFT + 72, y + 49, PLAYER_X - MUSIC_LEFT - 86),
+        12,
+        Weight::Normal,
+        Alignment::Left,
+      );
+      if let Some(pending) = &model.confirmation {
+        return paint_music_confirmation(cr, model, pending);
+      }
+      paint_timeline(cr, model)?;
+      cr.save()?;
+      cr.translate(
+        0.0,
+        f64::from(PANEL_Y + TRANSPORT_Y + model.player_shift() - 5),
+      );
+      transport(cr, model)?;
+      cr.restore()?;
+      return Ok(());
+    }
     picture(
       cr,
       model
@@ -2665,10 +2899,6 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       COVER,
       "♪",
     )?;
-    let (title, artist) = model.starting_song.as_ref().map_or(
-      (model.track.title.as_str(), model.track.artist.as_str()),
-      |(song, _)| (song.title.as_str(), song.artist.as_str()),
-    );
     color(cr, 0xcdd6f4, 1.0);
     label(
       cr,
@@ -3252,12 +3482,22 @@ pub enum BarRegion {
 }
 
 impl BarRegion {
-  pub fn bounds(self) -> (i32, i32, i32, i32) {
+  pub fn bounds(self, model: &Model) -> (i32, i32, i32, i32) {
     let left = MUSIC_LEFT;
     match self {
       Self::Header => (0, 0, WIDTH, HEIGHT),
-      Self::Timeline => (PLAYER_X + 6, PANEL_Y + SEEK_Y - 18, PLAYER_WIDTH - 14, 24),
-      Self::Lyrics => (MUSIC_LEFT, LIST_Y, PLAYER_X - MUSIC_LEFT, TAB_END - LIST_Y),
+      Self::Timeline => (
+        PLAYER_X + 6,
+        PANEL_Y + SEEK_Y - 18 + model.player_shift(),
+        PLAYER_WIDTH - 14,
+        24,
+      ),
+      Self::Lyrics => (
+        MUSIC_LEFT,
+        LIST_Y - 10,
+        WIDTH - 2 * MUSIC_LEFT,
+        LYRICS_BOTTOM + 24 - (LIST_Y - 10),
+      ),
       Self::Search => (left - 3, LIST_Y, PLAYER_X - left - 5, 30),
     }
   }

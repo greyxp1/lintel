@@ -926,7 +926,7 @@ fn music_clock_tick(
   model: Rc<RefCell<Model>>,
   display: Rc<Display>,
   last_position: Option<u64>,
-  last_lyric: Option<(usize, u32, bool)>,
+  last_lyric: Option<ui::LyricMarker>,
 ) {
   let mut state = model.borrow_mut();
   if state.panel != Panel::Music {
@@ -936,8 +936,8 @@ fn music_clock_tick(
   let position = (state.track.elapsed() * 4.0) as u64;
   let playing = state.timeline_animating();
   let timeline_changed = playing && last_position != Some(position);
-  let lyric = state.lyric_marker();
-  let lyrics_changed = lyric.is_some() && last_lyric != lyric;
+  let lyric = state.animated_lyric_marker();
+  let lyrics_changed = state.lyrics_view() && last_lyric != lyric;
   drop(state);
   if timeline_changed || lyrics_changed {
     let mut desktop = display.desktop.borrow_mut();
@@ -950,7 +950,7 @@ fn music_clock_tick(
     drop(desktop);
     display.draw(false);
   }
-  let delay = if playing && lyric.is_some() { 50 } else { 250 };
+  let delay = if playing && lyric.is_some() { 33 } else { 250 };
   glib::timeout_add_local_once(Duration::from_millis(delay), move || {
     music_clock_tick(model, display, Some(position), lyric);
   });

@@ -894,6 +894,8 @@ pub struct LyricLine {
 #[derive(Deserialize)]
 pub struct LyricWord {
   pub start: f64,
+  #[serde(default)]
+  pub end: Option<f64>,
   pub end_byte: u32,
 }
 

@@ -624,7 +624,7 @@ impl Desktop {
     let cr = Context::new(&buffer.image)?;
     cr.scale(f64::from(scale), f64::from(scale));
     if let Damage::Region(region) = buffer.damage {
-      let (x, y, w, h) = region.bounds();
+      let (x, y, w, h) = region.bounds(model);
       cr.rectangle(f64::from(x), f64::from(y), f64::from(w), f64::from(h));
       cr.clip();
       region.paint(&cr, model)?;
@@ -1070,12 +1070,20 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Desktop {
           if state
             .model
             .borrow_mut()
-            .move_search_focus(raw == xkb::keysyms::KEY_Down)
+            .scroll_focused_panel(raw == xkb::keysyms::KEY_Down)
           {
             state.actions.push(Action::SmallCovers);
             if let Some(bar) = &mut state.bar {
               bar.dirty = true;
             }
+          }
+        } else if raw == xkb::keysyms::KEY_Home && state.model.borrow_mut().follow_lyrics() {
+          if let Some(bar) = &mut state.bar {
+            bar.dirty = true;
+          }
+        } else if raw == xkb::keysyms::KEY_space && !state.model.borrow().search_keyboard() {
+          if let Some(action) = state.model.borrow().toggle_from_lyrics() {
+            state.actions.push(action);
           }
         } else if matches!(raw, xkb::keysyms::KEY_Return | xkb::keysyms::KEY_KP_Enter) {
           state.repeated_key = None;

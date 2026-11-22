@@ -2,6 +2,7 @@ import argparse
 import base64
 import fcntl
 import hashlib
+from http.client import HTTPException
 import json
 import os
 import re
@@ -9,12 +10,14 @@ import shutil
 import socket
 import subprocess
 from pathlib import Path
+from queue import Empty, Queue
 import sys
 import tempfile
+from threading import Thread
 import time
 import zlib
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from ytmusicapi import OAuthCredentials, YTMusic
 from ytmusicapi.exceptions import YTMusicServerError
@@ -351,32 +354,74 @@ def parse_krc(content):
     sheet = stream.decompress(packed, 1_000_000)
     if not stream.eof:
         return []
+    return parse_timed_lyrics(sheet.decode("utf-8-sig"), relative=True)
+
+
+def parse_timed_lyrics(sheet, *, relative):
+    stamp = re.compile(r"<(\d+),(\d+),-?\d+>" if relative else r"\((\d+),(\d+),-?\d+\)")
     lines = []
-    for row in sheet.decode("utf-8-sig").splitlines():
+    for row in sheet.splitlines():
         header = re.fullmatch(r"\[(\d+),(\d+)\](.*)", row)
         if not header:
             continue
         start, length = map(int, header.group(1, 2))
-        fragments, words, offset = [], [], 0
-        for at, fragment in re.findall(r"<(\d+),\d+,-?\d+>([^<]*)", header[3]):
+        pieces = stamp.split(header[3])
+        fragments = [pieces[0]]
+        words, offset = [], len(pieces[0].encode())
+        for at, span, fragment in zip(pieces[1::3], pieces[2::3], pieces[3::3], strict=True):
             fragments.append(fragment)
             offset += len(fragment.encode())
+            opened = int(at) + (start if relative else 0)
             if fragment.strip():
-                words.append({"start": (start + int(at)) / 1000, "end_byte": offset})
-        text = "".join(fragments)
+                words.append({"start": opened / 1000, "end": (opened + int(span)) / 1000,
+                              "end_byte": offset})
         if words:
-            lines.append({"text": text, "start": start / 1000,
+            lines.append({"text": "".join(fragments), "start": start / 1000,
                           "end": (start + length) / 1000, "words": words})
     return lines
 
 
-def word_lyrics(title, artist, duration):
-    if not (title and artist and duration > 0):
+def normalized(text):
+    return "".join(char for char in text.casefold() if char.isalnum())
+
+
+def netease_request(path, **params):
+    url = f"https://music.163.com/api/{path}?{urlencode(params)}"
+    request = Request(url, headers={"Referer": "https://music.163.com", "User-Agent": "Lintel"})
+    with urlopen(request, timeout=3) as response:
+        return json.loads(response.read(1_000_000))
+
+
+def netease_lyrics(title, artist, duration):
+    artists = {name for part in artist.split(",") if (name := normalized(part))}
+    if not artists:
         return None
+    try:
+        reply = netease_request("search/get", s=f"{title} {artist}", type=1, limit=5)
+    except (OSError, ValueError):
+        return None
+    matches = []
+    for song in (reply.get("result") or {}).get("songs") or []:
+        try:
+            names = {normalized(person["name"]) for person in song["artists"]}
+            drift = abs(song["duration"] / 1000 - duration)
+            if normalized(song["name"]) == normalized(title) and artists <= names and drift <= 3:
+                matches.append((len(names - artists), drift, song["id"]))
+        except (KeyError, TypeError, AttributeError):
+            continue
+    for _, _, song in sorted(matches)[:2]:
+        try:
+            reply = netease_request("song/lyric/v1", id=song, cp="false",
+                                    lv=0, tv=0, rv=0, kv=0, yv=0, ytv=0, yrv=0)
+            lines = parse_timed_lyrics((reply.get("yrc") or {}).get("lyric") or "", relative=False)
+            if lines:
+                return {"source": "NetEase", "lines": lines}
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return None
 
-    def normalized(text):
-        return "".join(char for char in text.casefold() if char.isalnum())
 
+def kugou_lyrics(title, artist, duration):
     try:
         length = round(duration * 1000)
         response = kugou_request("search", man="yes", keyword=f"{artist} - {title}", duration=length)
@@ -396,6 +441,33 @@ def word_lyrics(title, artist, duration):
                 return {"source": "Kugou", "lines": lines}
     except (OSError, ValueError, KeyError, TypeError, zlib.error):
         pass
+    return None
+
+
+def word_lyrics(title, artist, duration):
+    if not (title and artist and duration > 0):
+        return None
+    replies = Queue()
+
+    def lookup(provider):
+        result = None
+        try:
+            result = provider(title, artist, duration)
+        except (HTTPException, OSError, ValueError, KeyError, TypeError, AttributeError, zlib.error):
+            pass
+        finally:
+            replies.put(result)
+
+    for provider in (netease_lyrics, kugou_lyrics):
+        Thread(target=lookup, args=(provider,), daemon=True).start()
+    deadline = time.monotonic() + 5
+    for _ in range(2):
+        try:
+            result = replies.get(timeout=max(0, deadline - time.monotonic()))
+        except Empty:
+            break
+        if result:
+            return result
     return None
 
 
