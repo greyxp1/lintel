@@ -2,6 +2,7 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ impl Device {
   }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Volume {
   pub percent: u8,
   pub muted: bool,
@@ -101,7 +102,8 @@ pub fn streams(player: u32, music_only: bool, split_music: bool) -> Vec<Stream> 
       if music_only && !music {
         return None;
       }
-      if properties["node.passive"].as_str() == Some("true")
+      if properties["application.id"].as_str() == Some("lintel-mic-monitor")
+        || properties["node.passive"].as_str() == Some("true")
         || (item["client"].is_null() && properties["media.role"].as_str() == Some("production"))
       {
         return None;
@@ -220,15 +222,50 @@ fn set_target(target: &str, value: Option<u8>) -> io::Result<Volume> {
   get_target(target)
 }
 
-pub fn set_music(node: u64, value: Option<u8>) -> io::Result<Volume> {
-  set_target(&node.to_string(), value)
+fn music_state_path() -> std::path::PathBuf {
+  gio::glib::user_state_dir().join("lintel/music-levels.json")
+}
+
+fn saved_music() -> std::sync::MutexGuard<'static, [Option<Volume>; 2]> {
+  static LEVELS: OnceLock<Mutex<[Option<Volume>; 2]>> = OnceLock::new();
+  LEVELS
+    .get_or_init(|| {
+      let levels = std::fs::read(music_state_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+      Mutex::new(levels)
+    })
+    .lock()
+    .unwrap()
+}
+
+fn save_music(levels: &[Option<Volume>; 2]) -> io::Result<()> {
+  use gio::glib::{FileSetContentsFlags, file_set_contents_full};
+  let path = music_state_path();
+  std::fs::create_dir_all(path.parent().unwrap())?;
+  let data = serde_json::to_vec(levels)?;
+  file_set_contents_full(&path, &data, FileSetContentsFlags::CONSISTENT, 0o600)
+    .map_err(io::Error::other)
+}
+
+pub fn set_music(channel: MusicChannel, node: u64, value: Option<u8>) -> io::Result<Volume> {
+  let mut saved = saved_music();
+  let volume = set_target(&node.to_string(), value)?;
+  if saved[channel as usize] != Some(volume) {
+    saved[channel as usize] = Some(volume);
+    save_music(&saved)?;
+  }
+  Ok(volume)
 }
 
 pub fn music_levels() -> [Option<(u64, Volume)>; 2] {
+  let mut saved = saved_music();
   let Ok(objects) = graph() else {
     return [None; 2];
   };
-  MusicChannel::ALL.map(|channel| {
+  let old = *saved;
+  let levels = MusicChannel::ALL.map(|channel| {
     let object = find_node(&objects, channel.node())?;
     let node = id(object)?;
     let props = &object["info"]["params"]["Props"][0];
@@ -237,15 +274,37 @@ pub fn music_levels() -> [Option<(u64, Volume)>; 2] {
       .iter()
       .filter_map(Value::as_f64)
       .reduce(f64::max)?;
-    Some((
-      node,
-      Volume {
-        // WirePlumber's displayed gain is cubic.
-        percent: (gain.cbrt() * 100.0).round() as u8,
-        muted: props["mute"].as_bool().unwrap_or(false),
-      },
-    ))
-  })
+    let mut volume = Volume {
+      // WirePlumber's displayed gain is cubic.
+      percent: (gain.cbrt() * 100.0).round() as u8,
+      muted: props["mute"].as_bool().unwrap_or(false),
+    };
+    if let Some(wanted) = saved[channel as usize] {
+      let target = node.to_string();
+      if wanted.percent != volume.percent
+        && let Ok(updated) = set_target(&target, Some(wanted.percent))
+      {
+        volume = updated;
+      }
+      if wanted.muted != volume.muted
+        && Command::new("wpctl")
+          .args(["set-mute", &target, if wanted.muted { "1" } else { "0" }])
+          .status()
+          .is_ok_and(|status| status.success())
+      {
+        volume.muted = wanted.muted;
+      }
+    } else {
+      saved[channel as usize] = Some(volume);
+    }
+    Some((node, volume))
+  });
+  if old != *saved
+    && let Err(error) = save_music(&saved)
+  {
+    eprintln!("Saving music levels: {error}");
+  }
+  levels
 }
 
 pub fn step_output(step: i32) -> io::Result<Volume> {
@@ -390,23 +449,16 @@ fn music_stream_ids() -> Option<Vec<u64>> {
 
 struct MusicLink {
   ports: (u64, u64),
-  helper: Child,
+  helper: AudioHelper,
 }
 
-impl MusicLink {
-  fn connect(ports: (u64, u64)) -> io::Result<Self> {
-    let mut command = Command::new("pw-link");
-    command
-      .args([
-        "--monitor",
-        "--passive",
-        &ports.0.to_string(),
-        &ports.1.to_string(),
-      ])
-      .stdin(Stdio::null())
-      .stdout(Stdio::null());
+pub struct AudioHelper(Child);
+
+impl AudioHelper {
+  fn spawn(mut command: Command) -> io::Result<Self> {
+    command.stdin(Stdio::null()).stdout(Stdio::null());
     let parent = std::process::id() as libc::pid_t;
-    // Monitor mode owns the link until it disconnects, including when the shell crashes.
+    // Release the PipeWire streams and links even if the shell crashes.
     unsafe {
       command.pre_exec(move || {
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
@@ -418,17 +470,66 @@ impl MusicLink {
         Ok(())
       });
     }
-    Ok(Self {
-      ports,
-      helper: command.spawn()?,
-    })
+    command.spawn().map(Self)
+  }
+
+  pub fn monitor_source() -> io::Result<Option<String>> {
+    if music_mix_enabled() {
+      let objects = graph()?;
+      let source = find_node(&objects, "desktop_shell_voice_capture")
+        .and_then(|node| props(node)["target.object"].as_str())
+        .ok_or_else(|| io::Error::other("Voice source unavailable"))?;
+      Ok(Some(source.into()))
+    } else {
+      Ok(None)
+    }
+  }
+
+  pub fn monitoring(source: Option<&str>) -> io::Result<Self> {
+    let mut command = Command::new("pw-loopback");
+    if let Some(source) = source {
+      command.args(["--capture", source]);
+    }
+    command.args([
+      "--name",
+      "lintel-mic-monitor",
+      "--capture-props",
+      "{ application.id = lintel-mic-monitor node.dont-fallback = true }",
+      "--playback-props",
+      "{ application.id = lintel-mic-monitor }",
+    ]);
+    Self::spawn(command)
+  }
+
+  pub fn exited(&mut self) -> bool {
+    self.0.try_wait().is_ok_and(|status| status.is_some())
+  }
+
+  pub fn pid(&self) -> u32 {
+    self.0.id()
   }
 }
 
-impl Drop for MusicLink {
+impl Drop for AudioHelper {
   fn drop(&mut self) {
-    let _ = self.helper.kill();
-    let _ = self.helper.wait();
+    let _ = self.0.kill();
+    let _ = self.0.wait();
+  }
+}
+
+impl MusicLink {
+  fn connect(ports: (u64, u64)) -> io::Result<Self> {
+    let mut command = Command::new("pw-link");
+    command.args([
+      "--monitor",
+      "--passive",
+      &ports.0.to_string(),
+      &ports.1.to_string(),
+    ]);
+    Ok(Self {
+      ports,
+      helper: AudioHelper::spawn(command)?,
+    })
   }
 }
 
@@ -471,7 +572,7 @@ fn sync_links(links: &mut Vec<MusicLink>) -> io::Result<bool> {
     if !connected {
       ready = false;
       if let Some(link) = links.iter_mut().find(|link| link.ports == ports) {
-        if link.helper.try_wait()?.is_some() {
+        if link.helper.exited() {
           return Err(io::Error::other("Could not send music to the microphone"));
         }
       } else {

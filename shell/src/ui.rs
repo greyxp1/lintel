@@ -232,6 +232,7 @@ pub enum Action {
   HideBar(u64),
   Volume(Slider, Option<u8>),
   ToggleMic,
+  ToggleMonitor,
   Close(u32),
   PopupHover,
   Invoke(u32, String),
@@ -383,6 +384,7 @@ pub struct Model {
   pub audio_setting: bool,
   pub audio_revision: u64,
   pub mic_route: bool,
+  pub monitoring: bool,
   pub mic_error: Option<String>,
   pub mic_revision: u64,
   pub audio_error: Option<String>,
@@ -413,6 +415,7 @@ impl Model {
   pub fn hover_bar(&mut self, pointer: Option<(f64, f64)>) -> bool {
     let mut changed =
       matches!(self.panel, Panel::Music | Panel::History) && self.bar_pointer != pointer;
+    changed |= self.panel == Panel::Audio && monitor_hit(self.bar_pointer) != monitor_hit(pointer);
     self.bar_pointer = pointer;
     for (left, hover) in BUTTONS.into_iter().zip(&mut self.hover) {
       let active = pointer.is_some_and(|(x, y)| {
@@ -956,6 +959,9 @@ impl Model {
     }
     if self.panel == Panel::Audio {
       let pointer = Some((f64::from(x), f64::from(y)));
+      if !right && monitor_hit(pointer) {
+        return Some(Action::ToggleMonitor);
+      }
       if let Some((_, device)) = AUDIO_DEVICES
         .into_iter()
         .enumerate()
@@ -1183,6 +1189,10 @@ impl Model {
 }
 
 const SLIDER_X: i32 = PANEL_X + 135;
+const MONITOR_X: i32 = PANEL_X + PANEL_WIDTH - 40;
+fn monitor_hit(pointer: Option<(f64, f64)>) -> bool {
+  inside(pointer, MONITOR_X, PANEL_Y + 5, 28, 28)
+}
 const SLIDER_END: i32 = PANEL_X + PANEL_WIDTH - 48;
 
 fn audio_slider_y(index: usize) -> i32 {
@@ -2181,6 +2191,23 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       Weight::Semibold,
       Alignment::Left,
     );
+    let hovered = monitor_hit(model.bar_pointer);
+    if hovered || model.monitoring {
+      round(cr, MONITOR_X, PANEL_Y + 5, 28, 28, 6.0);
+      color(cr, 0xcba6f7, if hovered { 0.25 } else { 0.16 });
+      cr.fill()?;
+    }
+    color(cr, if model.monitoring { 0xa6e3a1 } else { 0xcdd6f4 }, 1.0);
+    let x = f64::from(MONITOR_X + 14);
+    let y = f64::from(PANEL_Y + 19);
+    cr.set_line_width(1.4);
+    cr.move_to(x - 5.0, y - 1.0);
+    cr.curve_to(x - 6.0, y - 9.0, x + 7.0, y - 9.0, x + 6.0, y - 1.0);
+    cr.curve_to(x + 5.0, y + 2.0, x + 2.0, y + 2.0, x + 1.0, y + 5.0);
+    cr.curve_to(x, y + 9.0, x - 5.0, y + 8.0, x - 5.0, y + 4.0);
+    cr.move_to(x - 2.0, y - 2.0);
+    cr.curve_to(x - 2.0, y - 5.0, x + 3.0, y - 5.0, x + 3.0, y - 2.0);
+    cr.stroke()?;
     for (index, (device, volume)) in [(Device::Output, model.output), (Device::Input, model.input)]
       .into_iter()
       .enumerate()

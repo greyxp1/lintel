@@ -202,6 +202,8 @@ fn run() -> Result<()> {
   let display_events = display.clone();
   let redraw = refresh.clone();
   let actions_router = router.clone();
+  let monitor = Rc::new(RefCell::new(None::<audio::AudioHelper>));
+  let monitor_starting = Rc::new(Cell::new(false));
   glib::unix_fd_add_local(
     fd,
     IOCondition::IN | IOCondition::HUP | IOCondition::ERR,
@@ -323,6 +325,57 @@ fn run() -> Result<()> {
             );
           }
           Action::OpenAudio => watch_audio(&model, &redraw),
+          Action::ToggleMonitor => {
+            if monitor_starting.get() {
+              continue;
+            }
+            if monitor.borrow_mut().take().is_some() {
+              model.borrow_mut().monitoring = false;
+              redraw();
+              continue;
+            }
+            monitor_starting.set(true);
+            let starting = monitor_starting.clone();
+            let monitor = monitor.clone();
+            let model = model.clone();
+            let redraw = redraw.clone();
+            background(audio::AudioHelper::monitor_source, move |result| {
+              starting.set(false);
+              match result.and_then(|source| audio::AudioHelper::monitoring(source.as_deref())) {
+                Ok(helper) => {
+                  let pid = helper.pid();
+                  monitor.replace(Some(helper));
+                  model.borrow_mut().monitoring = true;
+                  glib::timeout_add_local(Duration::from_millis(500), {
+                    let monitor = monitor.clone();
+                    let model = model.clone();
+                    let redraw = redraw.clone();
+                    move || {
+                      let mut helper = monitor.borrow_mut();
+                      let Some(process) = helper.as_mut() else {
+                        return ControlFlow::Break;
+                      };
+                      if process.pid() != pid {
+                        return ControlFlow::Break;
+                      }
+                      if !process.exited() {
+                        return ControlFlow::Continue;
+                      }
+                      helper.take();
+                      let mut state = model.borrow_mut();
+                      state.monitoring = false;
+                      state.audio_error = Some("Mic monitoring stopped".into());
+                      drop(state);
+                      redraw();
+                      ControlFlow::Break
+                    }
+                  });
+                }
+                Err(error) => model.borrow_mut().audio_error = Some(error.to_string()),
+              }
+              redraw();
+            });
+          }
           Action::SmallCovers => fetch_small_covers(&model, &redraw),
           Action::Volume(target, value) => {
             queue_volume(&model, &redraw, AudioChange::Slider(target, value));
@@ -909,7 +962,7 @@ fn write_volume(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
     move || match (target, change) {
       (_, AudioChange::OutputStep(step)) => audio::step_output(step).map(Some),
       (Slider::Device(device), _) => audio::set(device, value).map(Some),
-      (Slider::MusicLevel(_, node), _) => audio::set_music(node, value).map(Some),
+      (Slider::MusicLevel(channel, node), _) => audio::set_music(channel, node, value).map(Some),
       (Slider::Stream(_) | Slider::Music(_), _) => {
         let Some((members, muted)) = group else {
           return Ok(None);
