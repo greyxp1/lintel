@@ -857,7 +857,7 @@ impl Model {
           return Some(Action::Invoke(notice.id, key.clone()));
         }
       }
-      return notice.activate();
+      return notice.activate().or(Some(Action::Close(notice.id)));
     }
     if y >= self.panel_bottom() {
       return None;
@@ -2216,7 +2216,13 @@ fn paint_popup(
   );
   dismissal(cr, POPUP_CLOSE_X, POPUP_CLOSE_Y, close_hovered)?;
   color(cr, 0xcdd6f4, 1.0);
-  for (row, line) in notice.body.lines().take(2).enumerate() {
+  for (row, line) in notice
+    .body
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .take(2)
+    .enumerate()
+  {
     label(
       cr,
       line,
