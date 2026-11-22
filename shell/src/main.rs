@@ -14,9 +14,8 @@ use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use gio::glib::{self, ControlFlow, IOCondition, MainContext, MainLoop};
-
 use audio::{Device, Route};
+use gio::glib::{self, ControlFlow, IOCondition, MainContext, MainLoop};
 use services::Services;
 use ui::{Action, AudioChange, Model, MusicTab, Panel, Slider};
 use wayland::Desktop;
@@ -122,6 +121,7 @@ fn run() -> Result<()> {
   let display = Rc::new(Display {
     desktop: RefCell::new(Desktop::connect(model.clone())?),
     main_loop: main_loop.clone(),
+    failed: RefCell::new(None),
     wants_write: Cell::new(false),
     animating: Cell::new(false),
     search_timer: RefCell::new(None),
@@ -150,6 +150,7 @@ fn run() -> Result<()> {
         continue;
       }
       model.mic_route = update.enabled;
+      model.mic_pending = false;
       model.mic_error = update.error;
       drop(model);
       route_refresh();
@@ -211,8 +212,7 @@ fn run() -> Result<()> {
       let actions = match dispatched {
         Ok(actions) => actions,
         Err(error) => {
-          eprintln!("Wayland: {error}");
-          display_events.main_loop.quit();
+          display_events.fail(error);
           return ControlFlow::Break;
         }
       };
@@ -221,17 +221,41 @@ fn run() -> Result<()> {
           Action::Media { command, rewind } => media::control(command, rewind),
           Action::Seek(seconds) => {
             let mut state = model.borrow_mut();
-            state.track.position = seconds;
-            if state.track.progressing_since.is_some() {
-              state.track.progressing_since = Some(std::time::Instant::now());
-            }
+            let target = (state.track.id.clone(), seconds);
+            let position = state.track.position;
+            let progressing = state.track.progressing_since;
+            state.pending_seek = Some(target.clone());
+            state.playlist_error = None;
             drop(state);
-            media::seek(seconds);
+            let model = model.clone();
+            let redraw = redraw.clone();
+            redraw();
+            background(
+              move || media::seek(seconds),
+              move |succeeded| {
+                let mut state = model.borrow_mut();
+                if state.pending_seek.as_ref() != Some(&target) {
+                  return;
+                }
+                state.pending_seek = None;
+                if !succeeded {
+                  state.playlist_error = Some("Could not seek in this track".into());
+                } else if state.track.position == position
+                  && state.track.progressing_since == progressing
+                {
+                  state.track.position = seconds;
+                  state.track.progressing_since = progressing.map(|_| Instant::now());
+                }
+                drop(state);
+                redraw();
+              },
+            );
           }
           Action::DismissBar => {
             let mut state = model.borrow_mut();
             if state.dismiss_confirmation() {
               drop(state);
+              fetch_small_covers(&model, &redraw);
               redraw();
             } else if state.panel != Panel::None {
               state.select(Panel::None);
@@ -271,6 +295,44 @@ fn run() -> Result<()> {
             }
           }
           Action::Search(query) => search_music(query, &model, &redraw),
+          Action::AddSong(playlist, song) => {
+            let mut state = model.borrow_mut();
+            if state.adding_song || !state.signed_in {
+              continue;
+            }
+            state.adding_song = true;
+            state.add_feedback = Some(format!("Adding to {}…", playlist.name));
+            drop(state);
+            let model = model.clone();
+            let redraw = redraw.clone();
+            let socket = socket.clone();
+            let id = playlist.id.clone();
+            background(
+              move || media::add_song(&id, &song.id).map_err(|error| error.to_string()),
+              move |result| {
+                let mut state = model.borrow_mut();
+                state.adding_song = false;
+                if !state.signed_in {
+                  return;
+                }
+                let sync = result.is_ok()
+                  && state
+                    .selected_playlist
+                    .as_ref()
+                    .is_some_and(|active| active.id == playlist.id);
+                state.add_feedback = Some(match result {
+                  Ok(()) => format!("Added to {}", playlist.name),
+                  Err(error) => error,
+                });
+                drop(state);
+                if sync {
+                  refresh_active(&model, &redraw, &socket);
+                }
+                fetch_small_covers(&model, &redraw);
+                redraw();
+              },
+            );
+          }
           Action::PlayResult(song) => {
             watch_player();
             let mut state = model.borrow_mut();
@@ -370,6 +432,7 @@ fn run() -> Result<()> {
             watch_player();
             let mut state = model.borrow_mut();
             state.mic_route = !state.mic_route;
+            state.mic_pending = state.mic_route;
             state.mic_revision = state.mic_revision.wrapping_add(1);
             state.mic_error = None;
             let _ = actions_router.send(Route::Update {
@@ -512,7 +575,7 @@ fn run() -> Result<()> {
                   state.search_cursor = 0;
                   state.search_edited();
                   state.lyrics_id.clear();
-                  state.lyrics_lines.clear();
+                  state.lyrics = Default::default();
                   state.lyrics_status = None;
                   state.playlist_epoch = state.playlist_epoch.wrapping_add(1);
                   state.playlist_syncing = false;
@@ -715,7 +778,7 @@ fn run() -> Result<()> {
   main_loop.run();
   let _ = router.send(Route::Stop);
   let _ = route_worker.join();
-  Ok(())
+  display.failed.borrow_mut().take().map_or(Ok(()), Err)
 }
 
 fn toggle_picker(mut args: impl Iterator<Item = String>) -> Result<()> {
@@ -796,6 +859,7 @@ async fn watch_tracks(
     let queue_changed = state.track.queue_index != next.queue_index
       || !std::sync::Arc::ptr_eq(&state.track.queue_songs, &next.queue_songs);
     let track_changed = state.track.id != next.id;
+    let lyric_metadata_loaded = !state.track.has_lyric_metadata() && next.has_lyric_metadata();
     if !restore_attempted && next.has_track && !next.queue.is_empty() {
       restore_attempted = true;
       if state.playlist_epoch == 0 {
@@ -835,7 +899,8 @@ async fn watch_tracks(
     state.update_track(next);
     let expanded = state.panel == Panel::Music;
     let art_changed = previous_art != state.cover_url();
-    let lyrics = expanded && state.music_tab == MusicTab::Lyrics && track_changed;
+    let lyrics =
+      expanded && state.music_tab == MusicTab::Lyrics && (track_changed || lyric_metadata_loaded);
     drop(state);
     if lyrics {
       fetch_lyrics(&model, &refresh);
@@ -854,24 +919,40 @@ fn watch_music_clock(model: &Rc<RefCell<Model>>, display: &Rc<Display>) {
   if std::mem::replace(&mut model.borrow_mut().music_clock, true) {
     return;
   }
-  let model = model.clone();
-  let display = display.clone();
-  glib::timeout_add_local(Duration::from_millis(250), move || {
-    let mut state = model.borrow_mut();
-    if state.panel != Panel::Music {
-      state.music_clock = false;
-      return ControlFlow::Break;
+  music_clock_tick(model.clone(), display.clone(), None, None);
+}
+
+fn music_clock_tick(
+  model: Rc<RefCell<Model>>,
+  display: Rc<Display>,
+  last_position: Option<u64>,
+  last_lyric: Option<(usize, u32, bool)>,
+) {
+  let mut state = model.borrow_mut();
+  if state.panel != Panel::Music {
+    state.music_clock = false;
+    return;
+  }
+  let position = (state.track.elapsed() * 4.0) as u64;
+  let playing = state.timeline_animating();
+  let timeline_changed = playing && last_position != Some(position);
+  let lyric = state.lyric_marker();
+  let lyrics_changed = lyric.is_some() && last_lyric != lyric;
+  drop(state);
+  if timeline_changed || lyrics_changed {
+    let mut desktop = display.desktop.borrow_mut();
+    if timeline_changed {
+      desktop.repaint_bar(ui::BarRegion::Timeline);
     }
-    let animate = state.timeline_animating();
-    drop(state);
-    if animate {
-      display
-        .desktop
-        .borrow_mut()
-        .repaint_bar(ui::BarRegion::Timeline);
-      display.draw(false);
+    if lyrics_changed {
+      desktop.repaint_bar(ui::BarRegion::Lyrics);
     }
-    ControlFlow::Continue
+    drop(desktop);
+    display.draw(false);
+  }
+  let delay = if playing && lyric.is_some() { 50 } else { 250 };
+  glib::timeout_add_local_once(Duration::from_millis(delay), move || {
+    music_clock_tick(model, display, Some(position), lyric);
   });
 }
 
@@ -1092,6 +1173,7 @@ fn background<T: Send + 'static>(
 struct Display {
   desktop: RefCell<Desktop>,
   main_loop: MainLoop,
+  failed: RefCell<Option<Box<dyn std::error::Error>>>,
   wants_write: Cell<bool>,
   animating: Cell<bool>,
   search_timer: RefCell<Option<(Instant, glib::SourceId)>>,
@@ -1183,7 +1265,7 @@ impl Display {
   }
 
   fn fail(&self, error: Box<dyn std::error::Error>) {
-    eprintln!("Wayland: {error}");
+    *self.failed.borrow_mut() = Some(error);
     self.main_loop.quit();
   }
 }
@@ -1193,34 +1275,44 @@ fn fetch_lyrics(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   let song = state.track.id.clone();
   if song.is_empty() {
     state.lyrics_id.clear();
-    state.lyrics_lines.clear();
+    state.lyrics = Default::default();
     state.lyrics_status = Some("Play a song to see lyrics".into());
     drop(state);
     refresh();
     return;
   }
-  if state.lyrics_id == song {
+  let with_metadata = state.track.has_lyric_metadata();
+  if state.lyrics_id == song && (state.lyrics_metadata || !with_metadata) {
     return;
   }
   state.lyrics_id.clone_from(&song);
-  state.lyrics_lines.clear();
+  state.lyrics_metadata = with_metadata;
+  state.lyrics = Default::default();
   state.lyrics_status = Some("Loading lyrics…".into());
   state.reset_music_scroll();
   drop(state);
   let model = model.clone();
   let refresh = refresh.clone();
   let request = song.clone();
+  let (title, artist, duration) = {
+    let state = model.borrow();
+    (
+      state.track.title.clone(),
+      state.track.artist.clone(),
+      state.track.duration,
+    )
+  };
   background(
-    move || media::lyrics(&request).map_err(|error| error.to_string()),
+    move || media::lyrics(&request, &title, &artist, duration).map_err(|error| error.to_string()),
     move |result| {
       let mut state = model.borrow_mut();
-      if state.lyrics_id != song {
+      if state.lyrics_id != song || state.lyrics_metadata != with_metadata {
         return;
       }
       match result {
-        Ok(Some(lyrics)) if !lyrics.trim().is_empty() => {
+        Ok(Some(lyrics)) if !lyrics.lines.is_empty() => {
           state.lyrics_status = None;
-          state.lyrics_lines = lyrics.lines().map(str::to_owned).collect();
+          state.lyrics = lyrics;
         }
         Ok(_) => state.lyrics_status = Some("No lyrics available".into()),
         Err(_) => {
@@ -1242,6 +1334,7 @@ fn search_music(query: String, model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()
   }
   state.search_pending = None;
   let revision = state.search_revision;
+  state.clear_search_focus();
   state.search_results.clear();
   state.search_status = Some("Searching…".into());
   state.reset_music_scroll();

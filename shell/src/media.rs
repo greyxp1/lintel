@@ -1,12 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::{Cursor, Read};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 use gob::{StreamDeserializer, StreamSerializer};
 use image::{ImageReader, Limits};
@@ -34,6 +33,10 @@ pub struct Track {
 }
 
 impl Track {
+  pub fn has_lyric_metadata(&self) -> bool {
+    !self.title.is_empty() && !self.artist.is_empty() && self.duration > 0.0
+  }
+
   pub fn elapsed(&self) -> f64 {
     let delta = self
       .progressing_since
@@ -292,10 +295,8 @@ pub fn control(command: &'static str, rewind: bool) {
   });
 }
 
-pub fn seek(seconds: f64) {
-  thread::spawn(move || {
-    run_control(&["seek", &format!("{seconds:.2}")]);
-  });
+pub fn seek(seconds: f64) -> bool {
+  run_control(&["seek", &format!("{seconds:.2}")])
 }
 
 fn run_control(args: &[&str]) -> bool {
@@ -572,13 +573,16 @@ fn catalog_call<T>(
 fn library_request<T: serde::de::DeserializeOwned>(args: &[&str]) -> MediaResult<T> {
   let output = Command::new("lintel-ytmusic").args(args).output()?;
   if !output.status.success() {
+    let details = String::from_utf8_lossy(&output.stderr);
     return Err(
-      if output.status.code() == Some(3) {
-        "Sign in to see saved playlists"
-      } else {
-        "YouTube Music request failed. Check your connection or sign in again."
-      }
-      .into(),
+      details
+        .trim()
+        .lines()
+        .last()
+        .filter(|line| !line.is_empty())
+        .unwrap_or("YouTube Music request failed.")
+        .to_owned()
+        .into(),
     );
   }
   Ok(serde_json::from_slice(&output.stdout)?)
@@ -864,16 +868,51 @@ pub fn remove_song(
   Ok(playlist)
 }
 
+pub fn add_song(playlist: &str, song: &str) -> MediaResult<()> {
+  library_request(&["add", playlist, song])
+}
+
 pub fn search(query: &str) -> MediaResult<Vec<Song>> {
   library_request(&["search", query])
 }
 
-pub fn lyrics(song: &str) -> MediaResult<Option<String>> {
-  #[derive(Deserialize)]
-  struct Lyrics {
-    lyrics: String,
+#[derive(Default, Deserialize)]
+pub struct Lyrics {
+  pub source: String,
+  pub lines: Vec<LyricLine>,
+}
+
+#[derive(Deserialize)]
+pub struct LyricLine {
+  pub text: String,
+  pub start: Option<f64>,
+  pub end: Option<f64>,
+  #[serde(default)]
+  pub words: Vec<LyricWord>,
+}
+
+#[derive(Deserialize)]
+pub struct LyricWord {
+  pub start: f64,
+  pub end_byte: u32,
+}
+
+pub fn lyrics(id: &str, title: &str, artist: &str, duration: f64) -> MediaResult<Option<Lyrics>> {
+  let mut result: Option<Lyrics> = library_request(&[
+    "lyrics",
+    id,
+    &format!("--title={title}"),
+    &format!("--artist={artist}"),
+    &format!("--duration={duration}"),
+  ])?;
+  if let Some(lyrics) = &mut result
+    && lyrics.lines.iter().all(|line| line.start.is_some())
+  {
+    lyrics
+      .lines
+      .sort_by(|a, b| a.start.unwrap().total_cmp(&b.start.unwrap()));
   }
-  Ok(library_request::<Option<Lyrics>>(&["lyrics", song])?.map(|value| value.lyrics))
+  Ok(result)
 }
 
 pub fn play_result(socket: &Path, song: Song) -> MediaResult<()> {

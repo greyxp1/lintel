@@ -57,7 +57,7 @@ impl Drop for Buffer {
 
 struct Surface {
   blur: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
-  blur_size: Option<(i32, i32)>,
+  blur_size: Option<(i32, i32, bool)>,
   backing: Vec<Buffer>,
   surface: wl_surface::WlSurface,
   layer: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
@@ -76,6 +76,7 @@ struct BarMotion {
   from: i32,
   to: i32,
   closing: Option<ImageSurface>,
+  wide: bool,
 }
 
 impl BarMotion {
@@ -110,6 +111,7 @@ impl Surface {
         from,
         to: target,
         closing,
+        wide: self.blur_size.is_some_and(|(_, _, wide)| wide),
       });
       self.dirty = true;
     }
@@ -692,7 +694,12 @@ impl Desktop {
     }
     if kind == Layer::Bar {
       let region = compositor.create_region(qh, ());
-      region.add(ui::WING, 0, ui::PANEL_WIDTH, visible_height);
+      let left = (WIDTH - ui::PANEL_WIDTH) / 2;
+      region.add(left, 0, ui::PANEL_WIDTH, visible_height.min(HEIGHT));
+      if visible_height > HEIGHT {
+        let left = if model.wide_music() { ui::WING } else { left };
+        region.add(left, HEIGHT, WIDTH - 2 * left, visible_height - HEIGHT);
+      }
       surface.surface.set_input_region(Some(&region));
       region.destroy();
     }
@@ -701,10 +708,15 @@ impl Desktop {
       .as_ref()
       .filter(|motion| motion.closing.is_some())
       .map_or(model.bar_height(), |motion| motion.from.max(HEIGHT));
+    let wide = surface
+      .motion
+      .as_ref()
+      .filter(|motion| motion.closing.is_some())
+      .map_or(model.wide_music(), |motion| motion.wide);
     let blur_size = if kind == Layer::Bar {
-      (visible_height, outline_height)
+      (visible_height, outline_height, wide)
     } else {
-      (height, height)
+      (height, height, false)
     };
     if !matches!(kind, Layer::Corner(..)) && surface.blur_size != Some(blur_size) {
       if surface.blur.is_some() || kind == Layer::Popup {
@@ -725,8 +737,15 @@ impl Desktop {
           }
           surface.surface.set_input_region(Some(&region));
         } else if visible_height > ui::REVEAL_HEIGHT {
-          ui::bar_outline(&cr, outline_height);
-          add_blur_rows(&cr, &region, width, 0, visible_height, ui::WING + 17)?;
+          ui::bar_outline(&cr, outline_height, wide);
+          add_blur_rows(
+            &cr,
+            &region,
+            width,
+            0,
+            visible_height,
+            ui::HEADER_X + ui::WING + 17,
+          )?;
         }
         if let Some(blur) = &surface.blur {
           blur.set_blur_region(Some(&region));
@@ -1032,17 +1051,47 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Desktop {
         let code = xkb::Keycode::new(key + 8);
         let symbol = keyboard.key_get_one_sym(code);
         let repeatable = keyboard.get_keymap().key_repeats(code);
-        if symbol.raw() == xkb::keysyms::KEY_Escape {
+        let ctrl = keyboard.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
+        let raw = symbol.raw();
+        if raw == xkb::keysyms::KEY_Escape {
           state.actions.push(Action::DismissBar);
-        } else if matches!(
-          symbol.raw(),
-          xkb::keysyms::KEY_Return | xkb::keysyms::KEY_KP_Enter
-        ) {
+        } else if ctrl && (xkb::keysyms::KEY_1..=xkb::keysyms::KEY_4).contains(&raw) {
+          if let Some(action) = state
+            .model
+            .borrow_mut()
+            .music_tab_shortcut((raw - xkb::keysyms::KEY_1) as usize)
+          {
+            state.actions.push(action);
+            if let Some(bar) = &mut state.bar {
+              bar.dirty = true;
+            }
+          }
+        } else if matches!(raw, xkb::keysyms::KEY_Up | xkb::keysyms::KEY_Down) {
+          if state
+            .model
+            .borrow_mut()
+            .move_search_focus(raw == xkb::keysyms::KEY_Down)
+          {
+            state.actions.push(Action::SmallCovers);
+            if let Some(bar) = &mut state.bar {
+              bar.dirty = true;
+            }
+          }
+        } else if matches!(raw, xkb::keysyms::KEY_Return | xkb::keysyms::KEY_KP_Enter) {
           state.repeated_key = None;
-          let model = state.model.borrow();
-          let query = model.search_query.trim();
-          if model.search_keyboard() && !query.is_empty() {
-            state.actions.push(Action::Search(query.to_owned()));
+          let mut model = state.model.borrow_mut();
+          if let Some(action) = model.activate_search_focus(ctrl) {
+            state.actions.push(action);
+            if let Some(bar) = &mut state.bar {
+              bar.dirty = true;
+            }
+          } else if model.search_keyboard()
+            && !model.search_has_focus_row()
+            && !model.search_query.trim().is_empty()
+          {
+            state
+              .actions
+              .push(Action::Search(model.search_query.trim().to_owned()));
           }
         } else if state.edit_search_key(key) {
           state.repeated_key = state

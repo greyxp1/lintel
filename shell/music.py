@@ -1,8 +1,10 @@
 import argparse
+import base64
 import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -10,6 +12,9 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+import zlib
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 from ytmusicapi import OAuthCredentials, YTMusic
 from ytmusicapi.exceptions import YTMusicServerError
@@ -329,6 +334,93 @@ def remove_entry(yt, playlist_id, video_id, reply):
     return False
 
 
+def kugou_request(method, **params):
+    query = urlencode({**params, "ver": 1, "client": "pc"})
+    with urlopen(f"https://lyrics.kugou.com/{method}?{query}", timeout=3) as response:
+        return json.loads(response.read(1_000_000))
+
+
+def parse_krc(content):
+    encoded = base64.b64decode(content, validate=True)
+    if not encoded.startswith(b"krc1"):
+        return []
+    # KRC wraps a zlib stream with a repeating XOR mask after its four-byte signature.
+    mask = b"@Gaw^2tGQ61-\xce\xd2ni"
+    packed = bytes(byte ^ mask[index % len(mask)] for index, byte in enumerate(encoded[4:]))
+    stream = zlib.decompressobj()
+    sheet = stream.decompress(packed, 1_000_000)
+    if not stream.eof:
+        return []
+    lines = []
+    for row in sheet.decode("utf-8-sig").splitlines():
+        header = re.fullmatch(r"\[(\d+),(\d+)\](.*)", row)
+        if not header:
+            continue
+        start, length = map(int, header.group(1, 2))
+        fragments, words, offset = [], [], 0
+        for at, fragment in re.findall(r"<(\d+),\d+,-?\d+>([^<]*)", header[3]):
+            fragments.append(fragment)
+            offset += len(fragment.encode())
+            if fragment.strip():
+                words.append({"start": (start + int(at)) / 1000, "end_byte": offset})
+        text = "".join(fragments)
+        if words:
+            lines.append({"text": text, "start": start / 1000,
+                          "end": (start + length) / 1000, "words": words})
+    return lines
+
+
+def word_lyrics(title, artist, duration):
+    if not (title and artist and duration > 0):
+        return None
+
+    def normalized(text):
+        return "".join(char for char in text.casefold() if char.isalnum())
+
+    try:
+        length = round(duration * 1000)
+        response = kugou_request("search", man="yes", keyword=f"{artist} - {title}", duration=length)
+        matches = [
+            item for item in response.get("candidates", [])
+            if item.get("krctype") == 2
+            and normalized(item["song"]) == normalized(title)
+            and normalized(item["singer"]) == normalized(artist)
+            and abs(item["duration"] - length) <= 8000
+        ]
+        match = min(matches, key=lambda item: abs(item["duration"] - length), default=None)
+        if match:
+            reply = kugou_request("download", id=match["id"], accesskey=match["accesskey"],
+                                  fmt="krc", charset="utf8")
+            lines = parse_krc(reply.get("content", ""))
+            if lines:
+                return {"source": "Kugou", "lines": lines}
+    except (OSError, ValueError, KeyError, TypeError, zlib.error):
+        pass
+    return None
+
+
+def song_lyrics(yt, args):
+    if args.title is None:
+        lyrics_id = yt.get_watch_playlist(videoId=args.video_id).get("lyrics")
+        return yt.get_lyrics(lyrics_id) if lyrics_id else None
+    lyrics_id = yt.get_watch_playlist(videoId=args.video_id).get("lyrics")
+    if not lyrics_id:
+        return None
+    try:
+        reply = yt.get_lyrics(lyrics_id, timestamps=True)
+    except (KeyError, YTMusicServerError):
+        reply = None
+    if not reply:
+        reply = yt.get_lyrics(lyrics_id)
+    if not reply:
+        return None
+    lines = ([{"text": line.text, "start": line.start_time / 1000,
+               "end": line.end_time / 1000} for line in reply["lyrics"] if line.text.strip()]
+             if reply["hasTimestamps"]
+             else [{"text": line} for line in reply["lyrics"].strip().splitlines()])
+    return {"source": (reply.get("source") or "YouTube Music").removeprefix("Source: "), "lines": lines}
+
+
 def handle(yt, args):
     if args.command == "library":
         return [playlist(item) for item in library_playlists(yt)
@@ -342,8 +434,7 @@ def handle(yt, args):
         return [song(item) for item in yt.search(args.query, filter="songs", limit=20)
                 if item.get("videoId")]
     if args.command == "lyrics":
-        lyrics_id = yt.get_watch_playlist(videoId=args.video_id).get("lyrics")
-        return yt.get_lyrics(lyrics_id) if lyrics_id else None
+        return song_lyrics(yt, args)
     if args.command == "remove":
         return remove_song(yt, args.playlist_id, args.video_id)
     result = yt.add_playlist_items(args.playlist_id, [args.video_id])
@@ -369,7 +460,11 @@ def main():
     listing.add_argument("--prefer-cache", action="store_true", help=argparse.SUPPRESS)
     listing.add_argument("--first-page", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("search", help="Search for songs").add_argument("query")
-    sub.add_parser("lyrics", help="Read lyrics for a video ID").add_argument("video_id")
+    lyrics = sub.add_parser("lyrics", help="Read lyrics for a video ID")
+    lyrics.add_argument("video_id")
+    lyrics.add_argument("--title", help=argparse.SUPPRESS)
+    lyrics.add_argument("--artist", default="", help=argparse.SUPPRESS)
+    lyrics.add_argument("--duration", type=float, default=0, help=argparse.SUPPRESS)
     for name, help_text in [("add", "Add a track to a playlist"), ("remove", "Remove a track from a playlist")]:
         command = sub.add_parser(name, help=help_text)
         command.add_argument("playlist_id")
@@ -388,6 +483,11 @@ def main():
             if args.library:
                 print(json.dumps(playlists, ensure_ascii=False))
         else:
+            if args.command == "lyrics" and args.title is not None:
+                words = word_lyrics(args.title, args.artist, args.duration)
+                if words:
+                    print(json.dumps(words, ensure_ascii=False))
+                    return 0
             if args.command == "playlist" and args.prefer_cache:
                 cached = cached_playlist(cache_file(args.playlist_id))
                 if cached is not None:
