@@ -22,7 +22,7 @@ const BUTTON_WIDTH: i32 = 32;
 const PLAYLIST_WIDTH: i32 = 149;
 const PLAYER_X: i32 = PANEL_X + PLAYLIST_WIDTH;
 const PLAYER_WIDTH: i32 = PANEL_WIDTH - PLAYLIST_WIDTH;
-const TRANSPORT_X: i32 = PLAYER_X + (PLAYER_WIDTH - 5 * BUTTON_WIDTH) / 2;
+const TRANSPORT_X: i32 = PLAYER_X + (PLAYER_WIDTH - 4 * BUTTON_WIDTH) / 2;
 const SEEK_Y: i32 = 236;
 const TRANSPORT_Y: i32 = 249;
 const TAB_Y: i32 = PANEL_Y + 10;
@@ -951,6 +951,9 @@ impl Model {
       };
     }
     if self.panel == Panel::Music {
+      if self.signed_in && self.music_mix && !right && music_mic_hit(Some((x.into(), y.into()))) {
+        return Some(Action::ToggleMic);
+      }
       if self.signed_in && (MUSIC_GAIN_TOP - 8..=MUSIC_GAIN_BOTTOM + 8).contains(&y) {
         for channel in MusicChannel::ALL {
           if (x - music_gain_x(channel)).abs() <= 12
@@ -1012,11 +1015,10 @@ impl Model {
       let relative_y = y - PANEL_Y;
       let controls = x - TRANSPORT_X;
       if (TRANSPORT_Y..TRANSPORT_Y + 29).contains(&relative_y)
-        && (0..5 * BUTTON_WIDTH).contains(&controls)
+        && (0..4 * BUTTON_WIDTH).contains(&controls)
       {
         return match controls / BUTTON_WIDTH {
-          0 => Some(Action::ToggleMic),
-          4 if self.can_remove_song() => {
+          3 if self.can_remove_song() => {
             self.removal = self.selected_playlist.as_ref().map(|playlist| Removal {
               playlist: playlist.id.clone(),
               song: self.track.id.clone(),
@@ -1024,11 +1026,11 @@ impl Model {
             });
             None
           }
-          index @ 1..=3 if self.track.has_track => {
-            let command = ["prev", "toggle", "next"][index as usize - 1];
+          index @ 0..=2 if self.track.has_track => {
+            let command = ["prev", "toggle", "next"][index as usize];
             Some(Action::Media {
               command,
-              rewind: index == 2 && self.track.at_end,
+              rewind: index == 1 && self.track.at_end,
             })
           }
           _ => None,
@@ -1148,6 +1150,16 @@ fn music_gain_x(channel: MusicChannel) -> i32 {
     MusicChannel::Listen => PLAYER_X + margin,
     MusicChannel::Send => PLAYER_X + PLAYER_WIDTH - margin,
   }
+}
+
+fn music_mic_hit(pointer: Option<(f64, f64)>) -> bool {
+  inside(
+    pointer,
+    music_gain_x(MusicChannel::Send) - 12,
+    MUSIC_GAIN_TOP - 28,
+    24,
+    24,
+  )
 }
 
 fn audio_button_hit(pointer: Option<(f64, f64)>, index: usize) -> bool {
@@ -1473,11 +1485,10 @@ fn paint_timeline(cr: &Context, model: &Model) -> cairo::Result<()> {
 
 fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
   let track = &model.track;
-  for index in 0..5 {
+  for index in 0..4 {
     let x = TRANSPORT_X + index * BUTTON_WIDTH;
     let enabled = match index {
-      0 => true,
-      4 => model.can_remove_song(),
+      3 => model.can_remove_song(),
       _ => track.has_track,
     };
     if enabled
@@ -1490,13 +1501,13 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
       )
     {
       round(cr, x + 2, 6, BUTTON_WIDTH - 4, 28, 6.0);
-      color(cr, if index == 4 { 0xf38ba8 } else { 0xcba6f7 }, 0.20);
+      color(cr, if index == 3 { 0xf38ba8 } else { 0xcba6f7 }, 0.20);
       cr.fill()?;
     }
   }
   color(cr, 0xcdd6f4, if track.has_track { 1.0 } else { 0.4 });
   for index in 0..3 {
-    let x = f64::from(TRANSPORT_X + BUTTON_WIDTH / 2 + (index + 1) * BUTTON_WIDTH);
+    let x = f64::from(TRANSPORT_X + BUTTON_WIDTH / 2 + index * BUTTON_WIDTH);
     if index == 1 && track.playing {
       cr.rectangle(x - 4.0, 15.0, 3.0, 10.0);
       cr.rectangle(x + 1.0, 15.0, 3.0, 10.0);
@@ -1512,7 +1523,7 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
     }
     cr.fill()?;
   }
-  let trash = f64::from(TRANSPORT_X + BUTTON_WIDTH * 4 + BUTTON_WIDTH / 2);
+  let trash = f64::from(TRANSPORT_X + BUTTON_WIDTH * 3 + BUTTON_WIDTH / 2);
   color(
     cr,
     if model.can_remove_song() {
@@ -1533,18 +1544,6 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
   cr.line_to(trash + 4.5, 18.0);
   cr.stroke()?;
 
-  let mic = TRANSPORT_X + BUTTON_WIDTH / 2;
-  color(cr, if model.mic_route { 0xa6e3a1 } else { 0xcdd6f4 }, 1.0);
-  round(cr, mic - 3, 12, 6, 10, 3.0);
-  cr.stroke()?;
-  cr.arc(f64::from(mic), 19.0, 5.0, 0.0, std::f64::consts::PI);
-  cr.move_to(f64::from(mic), 24.0);
-  cr.rel_line_to(0.0, 3.0);
-  if !model.mic_route {
-    cr.move_to(f64::from(mic - 7), 26.0);
-    cr.line_to(f64::from(mic + 7), 12.0);
-  }
-  cr.stroke()?;
   Ok(())
 }
 
@@ -1848,18 +1847,42 @@ fn paint_audio_device(cr: &Context, x: f64, y: f64, device: Device) -> cairo::Re
 }
 
 fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo::Result<()> {
-  let Some((slider, volume)) = model.music_slider(channel) else {
-    return Ok(());
-  };
-  let volume = model.volume(slider, Some(volume)).unwrap_or(volume);
   let x = music_gain_x(channel);
-  let height = MUSIC_GAIN_BOTTOM - MUSIC_GAIN_TOP;
+  let icon_y = MUSIC_GAIN_TOP - 16;
+  let level = model.music_slider(channel);
+  if level.is_none() && (channel == MusicChannel::Listen || !model.music_mix) {
+    return Ok(());
+  }
   let device = match channel {
     MusicChannel::Listen => Device::Output,
     MusicChannel::Send => Device::Input,
   };
-  color(cr, 0xcdd6f4, 1.0);
-  paint_audio_device(cr, f64::from(x), f64::from(MUSIC_GAIN_TOP - 16), device)?;
+  let send = channel == MusicChannel::Send;
+  if send && music_mic_hit(model.bar_pointer) {
+    round(cr, x - 12, icon_y - 12, 24, 24, 6.0);
+    color(cr, 0xcba6f7, 0.20);
+    cr.fill()?;
+  }
+  color(
+    cr,
+    if send && model.mic_route {
+      0xa6e3a1
+    } else {
+      0xcdd6f4
+    },
+    1.0,
+  );
+  paint_audio_device(cr, f64::from(x), f64::from(icon_y), device)?;
+  if send && !model.mic_route {
+    cr.move_to(f64::from(x - 7), f64::from(icon_y + 7));
+    cr.line_to(f64::from(x + 7), f64::from(icon_y - 7));
+    cr.stroke()?;
+  }
+  let Some((slider, volume)) = level else {
+    return Ok(());
+  };
+  let volume = model.volume(slider, Some(volume)).unwrap_or(volume);
+  let height = MUSIC_GAIN_BOTTOM - MUSIC_GAIN_TOP;
   color(cr, 0x45475a, 1.0);
   round(cr, x - 3, MUSIC_GAIN_TOP, 6, height, 3.0);
   cr.fill()?;
@@ -2468,7 +2491,11 @@ fn paint_bar(cr: &Context, model: &Model) -> cairo::Result<()> {
   for (stroke, alpha) in [(14.0, 0.025), (10.0, 0.035), (6.0, 0.06), (3.0, 0.11)] {
     cr.append_path(&outline);
     cr.set_line_width(stroke);
-    color(cr, 0, alpha);
+    // Fade into the top edge, where the shoulder meets the surface boundary.
+    let fade = cairo::LinearGradient::new(0.0, 0.0, 0.0, 18.0);
+    fade.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 0.0);
+    fade.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, alpha);
+    cr.set_source(&fade)?;
     cr.stroke()?;
   }
   cr.restore()?;
