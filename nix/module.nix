@@ -5,52 +5,48 @@
   utils,
   ...
 }: let
-  cfg = config.services.rustbg;
+  cfg = config.services.lintel;
 in {
-  options.services.rustbg = {
-    enable = lib.mkEnableOption "static Wayland wallpapers";
-    package = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.callPackage ./package.nix {};
-      defaultText = lib.literalExpression "pkgs.callPackage ./nix/package.nix {}";
-      description = "The rustbg package to use.";
+  imports = [./audio.nix];
+
+  options.services.lintel = {
+    enable = lib.mkEnableOption "the Wayland desktop shell";
+    package = lib.mkPackageOption pkgs "lintel" {
+      default = null;
+      extraDescription = "The package built by the desktop shell repository.";
     };
-    wallpapers = lib.mkOption {
+    wallpaper = lib.mkOption {
+      type = lib.types.path;
+      description = "Static wallpaper image.";
+    };
+    backdropBlur = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 0 1024);
+      default = null;
+      description = "Blur radius for a separate backdrop. Null creates no backdrop.";
+    };
+    playlists = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
       default = {};
-      description = "Named wallpaper instances.";
-      type = lib.types.attrsOf (lib.types.submodule {
-        options = {
-          image = lib.mkOption {
-            type = lib.types.path;
-            description = "Wallpaper image.";
-          };
-          blur = lib.mkOption {
-            type = lib.types.ints.between 0 1024;
-            default = 0;
-            description = "Gaussian blur sigma in output pixels.";
-          };
-        };
-      });
+      description = "Pinned playlists keyed by name, with YouTube Music playlist IDs as values.";
     };
   };
 
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [cfg.package];
-    systemd.user.services = lib.mapAttrs' (name: wallpaper:
-      lib.nameValuePair "rustbg-${name}" {
-        description = "Static ${name}";
-        wantedBy = ["graphical-session.target"];
-        after = ["graphical-session.target"];
-        partOf = ["graphical-session.target"];
-        serviceConfig = {
-          ExecStart = utils.escapeSystemdExecArgs (
-            ["${lib.getExe cfg.package}" "--namespace" "rustbg-${name}"]
-            ++ lib.optionals (wallpaper.blur != 0) ["--blur" (toString wallpaper.blur)]
-            ++ [wallpaper.image]
-          );
-          Restart = "on-failure";
-        };
-      })
-    cfg.wallpapers;
+    systemd.user.services.lintel = {
+      description = "Wayland desktop shell";
+      wantedBy = ["graphical-session.target"];
+      after = ["graphical-session.target"];
+      partOf = ["graphical-session.target"];
+      enableDefaultPath = false;
+      serviceConfig = {
+        ExecStart = utils.escapeSystemdExecArgs (
+          [ (lib.getExe cfg.package) "--wallpaper" "${cfg.wallpaper}" ]
+          ++ lib.optionals (cfg.backdropBlur != null) ["--backdrop-blur" (toString cfg.backdropBlur)]
+          ++ lib.concatLists (lib.mapAttrsToList (name: id: ["--playlist" "${name}=${id}"]) cfg.playlists)
+        );
+        Restart = "on-failure";
+      };
+    };
   };
 }

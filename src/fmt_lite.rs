@@ -2,8 +2,6 @@
 //! [`StringOnStack::push`], which accepts anything implementing [`FmtLite`].
 
 use core::ffi::c_char;
-#[cfg(feature = "standalone")]
-use core::ffi::CStr;
 
 /// Something that can be appended to a [`StringOnStack`].
 pub trait FmtLite {
@@ -78,19 +76,6 @@ impl<const N: usize> StringOnStack<N> {
   }
 
   #[must_use]
-  #[cfg(feature = "standalone")]
-  pub const fn is_empty(&self) -> bool {
-    self.len == 0
-  }
-
-  #[cfg(feature = "standalone")]
-  pub fn clear(&mut self) {
-    self.len = 0;
-    if let Some(first) = self.buf.first_mut() {
-      *first = 0;
-    }
-  }
-
   #[must_use]
   pub fn as_bytes(&self) -> &[u8] {
     self.buf.get(..self.len).unwrap_or(&[])
@@ -107,15 +92,6 @@ impl<const N: usize> StringOnStack<N> {
   }
 
   #[must_use]
-  #[cfg(feature = "standalone")]
-  pub fn as_c_str(&self) -> &CStr {
-    self
-      .buf
-      .get(..=self.len)
-      .and_then(|b| CStr::from_bytes_until_nul(b).ok())
-      .unwrap_or(c"")
-  }
-
   /// Append a string or a number (anything [`FmtLite`]). Chainable.
   pub fn push<T: FmtLite>(&mut self, value: T) -> &mut Self {
     value.append_to(self);

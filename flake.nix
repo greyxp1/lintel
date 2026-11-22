@@ -1,20 +1,16 @@
 {
-  description = "Minimal static Wayland wallpaper client";
+  description = "Lintel, a native Wayland desktop shell";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/f9a75f41be3a74eab55d3a7679d34ad6cc0da977";
 
   outputs = {nixpkgs, ...}: let
     system = "x86_64-linux";
     pkgs = import nixpkgs {inherit system;};
-    rustbg = pkgs.callPackage ./nix/package.nix {};
+    lintel = pkgs.callPackage ./nix/shell.nix {};
   in {
-    packages.${system} = {
-      inherit rustbg;
-      default = rustbg;
-    };
-    devShells.${system}.default = pkgs.mkShell {
-      inputsFrom = [rustbg];
-      inherit (rustbg) RUSTC_BOOTSTRAP RUSTFLAGS;
-    };
     nixosModules.default = ./nix/module.nix;
+    packages.${system} = {
+      inherit lintel;
+      default = lintel;
+    };
   };
 }

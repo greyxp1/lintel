@@ -1,27 +1,32 @@
-# Rustbg
+# Lintel
 
-Minimal static wallpapers for Wayland. Forked from [rusty-wl-utils](https://github.com/spaceavenue/rusty-wl-utils) by [spaceavenue](https://github.com/spaceavenue).
+A native Wayland shell for Niri with an edge-attached bar, notification history,
+a tray and wallpaper rendering from [greyxp1/rustbg](https://github.com/greyxp1/rustbg).
 
-Supports x86-64 Linux and compositors with `wlr-layer-shell`.
+Run it in a Wayland session with an available notification and tray bus name.
 
-For NixOS, add `github:greyxp1/rustbg` as a flake input:
-
-```nix
-{inputs, ...}: {
-  imports = [inputs.rustbg.nixosModules.default];
-  services.rustbg = {
-    enable = true;
-    wallpapers = {
-      wallpaper.image = ./wallpaper.jpg; # Namespace: rustbg-wallpaper
-      backdrop = {                       # Namespace: rustbg-backdrop
-        image = ./wallpaper.jpg;
-        blur = 7;                        # Blur strength, 0–1024.
-      };
-    };
-  };
-}
+```sh
+nix run . -- --wallpaper /path/to/image.jpg --backdrop-blur 7
+nix run . -- player
 ```
 
-For a blurred Niri overview, match `rustbg-backdrop` in a layer rule with `place-within-backdrop true`.
+The player command opens the terminal playback client.
 
-Source builds require nightly Rust, `rust-src` and FFmpeg.
+Hover at the center of the top edge to reveal the bar. Open the music button for
+cover art, controls and playlists. Each playlist starts shuffled. Add
+`--playlist NAME=ID` to pin a playlist alongside the signed-in library.
+
+Select **Sign in to YouTube Music** and sign in to Google in the browser window.
+Close that window once YouTube Music opens. Lintel then connects your library. Set
+`LINTEL_LOGIN_BROWSER` to choose a Chromium-based browser for sign-in.
+
+Lintel reloads your library after sign-in and checks the playing playlist every
+15 seconds. Run `lintel music --help` for search, playlist edits, and lyrics.
+Playback uses ytmd and depends on whether it can stream each track.
+
+The audio panel controls the default output and input. With the music mic
+module enabled, applications use the regular **Microphone**. **Music to mic**
+adds or removes the stereo player stream from that input. Set
+`services.lintel.musicMic.voiceSource` to the internal filtered voice
+node and, if replacing an existing microphone, use its PipeWire name for
+`sourceName` so existing application selections carry over.

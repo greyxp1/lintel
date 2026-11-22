@@ -1,7 +1,5 @@
 #![no_std]
 
-#[cfg(feature = "standalone")]
-pub mod cli;
 mod env;
 mod error;
 mod fmt_lite;
@@ -24,16 +22,6 @@ pub struct Config {
   image_path: StringOnStack<256>,
   namespace: StringOnStack<256>,
   blur: u32,
-}
-
-impl Default for Config {
-  fn default() -> Self {
-    Self {
-      image_path: StringOnStack::new(),
-      namespace: StringOnStack::from("wallpaper"),
-      blur: 0,
-    }
-  }
 }
 
 impl Config {

@@ -25,9 +25,3 @@ pub fn write_stderr(msg: impl AsRef<[u8]>) {
   let fd = unsafe { BorrowedFd::borrow_raw(2) };
   let _ = write_fd(fd, msg);
 }
-
-#[cfg(feature = "standalone")]
-pub fn write_stdout(msg: impl AsRef<[u8]>) {
-  let fd = unsafe { BorrowedFd::borrow_raw(1) };
-  let _ = write_fd(fd, msg);
-}
