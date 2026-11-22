@@ -626,7 +626,13 @@ impl Model {
         }
       }
       Panel::Audio => {
-        PANEL_Y + APP_AUDIO_Y + self.count().clamp(1, VISIBLE_ROWS) as i32 * ROW_HEIGHT
+        let count = self.count().min(VISIBLE_ROWS) as i32;
+        PANEL_Y
+          + if count == 0 && self.audio_error.is_none() {
+            106
+          } else {
+            APP_AUDIO_Y + count * ROW_HEIGHT
+          }
       }
       Panel::History | Panel::Tray => {
         PANEL_Y + 42 + self.count().clamp(1, VISIBLE_ROWS) as i32 * ROW_HEIGHT
@@ -2044,6 +2050,9 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
         Alignment::Left,
       );
     }
+    if model.count() == 0 {
+      return Ok(());
+    }
     color(cr, 0xa6adc8, 1.0);
     label(
       cr,
@@ -2053,16 +2062,6 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       Weight::Semibold,
       Alignment::Left,
     );
-    if model.count() == 0 {
-      label(
-        cr,
-        "No active audio streams",
-        (left, PANEL_Y + APP_AUDIO_Y + 9, PANEL_WIDTH - 24),
-        13,
-        Weight::Normal,
-        Alignment::Left,
-      );
-    }
     let offset = model.offset.min(model.count().saturating_sub(VISIBLE_ROWS));
     for (row, stream) in model
       .app_streams()
