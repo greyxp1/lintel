@@ -1,5 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -7,7 +9,7 @@ use gio::glib::{self, Variant, variant::ToVariant};
 use gio::{Cancellable, DBusCallFlags, DBusConnection, DBusNodeInfo, DBusSignalFlags};
 
 use crate::media::Art;
-use crate::ui::{Address, Countdown, Model, Notice, TrayItem, image};
+use crate::ui::{Address, Countdown, Model, Notice, TrayItem, app_icon, image};
 
 const NOTIFY: &str = "org.freedesktop.Notifications";
 const NOTIFY_PATH: &str = "/org/freedesktop/Notifications";
@@ -21,6 +23,89 @@ const SHELL: &str = "org.lintel.Shell";
 const SHELL_PATH: &str = "/org/lintel/Shell";
 const HISTORY_LIMIT: usize = 100;
 const TRAY_LIMIT: usize = 32;
+
+fn notification_image(hints: &HashMap<String, Variant>, icon: &str) -> Option<cairo::ImageSurface> {
+  for key in ["image-data", "image_data", "icon_data"] {
+    if let Some(raw) = hints.get(key).and_then(notification_pixels) {
+      return Some(raw);
+    }
+  }
+  for candidate in [
+    hints
+      .get("image-path")
+      .or_else(|| hints.get("image_path"))
+      .and_then(Variant::str),
+    Some(icon),
+    hints.get("desktop-entry").and_then(Variant::str),
+  ]
+  .into_iter()
+  .flatten()
+  {
+    let local = if candidate.starts_with("file://") {
+      gio::glib::filename_from_uri(candidate)
+        .ok()
+        .filter(|(_, host)| host.as_deref().is_none_or(|host| host == "localhost"))
+        .map(|(path, _)| path)
+    } else if candidate.starts_with('/') {
+      Some(std::path::PathBuf::from(candidate))
+    } else {
+      if let Some(icon) = app_icon(candidate) {
+        return Some(icon);
+      }
+      continue;
+    };
+    if let Some(path) = local
+      && let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+      && file.metadata().is_ok_and(|metadata| metadata.is_file())
+    {
+      let mut bytes = Vec::new();
+      const LIMIT: u64 = 2 << 20;
+      if file.take(LIMIT + 1).read_to_end(&mut bytes).is_ok()
+        && bytes.len() as u64 <= LIMIT
+        && let Some(icon) = crate::media::decode_art(bytes, 48).and_then(image)
+      {
+        return Some(icon);
+      }
+    }
+  }
+  None
+}
+
+fn notification_pixels(raw: &Variant) -> Option<cairo::ImageSurface> {
+  if raw.type_().as_str() != "(iiibiiay)" {
+    return None;
+  }
+  let width = u32::try_from(raw.child_get::<i32>(0)).ok()?;
+  let height = u32::try_from(raw.child_get::<i32>(1)).ok()?;
+  let stride = usize::try_from(raw.child_get::<i32>(2)).ok()?;
+  let alpha = raw.child_get::<bool>(3);
+  let channels = if alpha { 4 } else { 3 };
+  if !(1..=512).contains(&width)
+    || !(1..=512).contains(&height)
+    || raw.child_get::<i32>(4) != 8
+    || raw.child_get::<i32>(5) != channels as i32
+  {
+    return None;
+  }
+  let row_bytes = width as usize * channels;
+  let data = raw.child_value(6);
+  let data = data.fixed_array::<u8>().ok()?;
+  let size = stride
+    .checked_mul(height as usize - 1)?
+    .checked_add(row_bytes)?;
+  if stride < row_bytes || size > data.len() {
+    return None;
+  }
+  let pixels = ::image::RgbaImage::from_fn(width, height, |x, y| {
+    let start = y as usize * stride + x as usize * channels;
+    let px = &data[start..start + channels];
+    ::image::Rgba([px[0], px[1], px[2], if alpha { px[3] } else { 255 }])
+  });
+  image(crate::media::thumbnail_art(pixels.into(), 48))
+}
 
 const NOTIFY_XML: &str = r#"
 <node><interface name="org.freedesktop.Notifications">
@@ -183,7 +268,7 @@ impl Services {
       .register_object(NOTIFY_PATH, &interface)
       .method_call(move |_, _, _, _, method, args, invocation| {
         let result = match method {
-          "GetCapabilities" => (vec!["actions", "body"],).to_variant(),
+          "GetCapabilities" => (vec!["actions", "body", "icon-static"],).to_variant(),
           "GetServerInformation" => {
             ("Lintel", "Lintel", env!("CARGO_PKG_VERSION"), "1.2").to_variant()
           }
@@ -234,20 +319,25 @@ impl Services {
       .map(|(key, label)| (key, label.chars().take(100).collect()))
       .collect();
     let hints = args.child_get::<HashMap<String, Variant>>(6);
+    let icon = notification_image(&hints, &args.child_get::<String>(2));
     let timeout = args.child_get::<i32>(7);
     let duration = (timeout != 0)
       .then(|| Duration::from_millis(if timeout < 0 { 5500 } else { timeout as u64 }));
+    let popup = !model.do_not_disturb;
     model.notices.push_front(Notice {
       id,
       summary: args.child_get::<String>(3).chars().take(256).collect(),
       body: args.child_get::<String>(4).chars().take(1024).collect(),
       actions,
       live: true,
-      popup: true,
-      transient: hints
-        .get("transient")
-        .and_then(Variant::get)
-        .unwrap_or(false),
+      popup,
+      seen: false,
+      image: icon,
+      transient: popup
+        && hints
+          .get("transient")
+          .and_then(Variant::get)
+          .unwrap_or(false),
       resident: hints
         .get("resident")
         .and_then(Variant::get)
@@ -268,6 +358,28 @@ impl Services {
     self.sync_hover();
     (self.refresh)();
     id
+  }
+
+  pub fn toggle_do_not_disturb(self: &Rc<Self>) {
+    let mut model = self.model.borrow_mut();
+    model.do_not_disturb = !model.do_not_disturb;
+    if model.do_not_disturb {
+      for notice in model.notices.iter_mut().filter(|notice| notice.popup) {
+        notice.popup = false;
+        notice.transient = false;
+        if let Some(delay) = notice.countdown.as_mut().and_then(|countdown| {
+          if countdown.expiry_delay().is_some() {
+            return None;
+          }
+          countdown.resume();
+          countdown.expiry_delay()
+        }) {
+          self.schedule_expiry(notice.id, delay);
+        }
+      }
+    }
+    drop(model);
+    self.hover_popup();
   }
 
   fn cancel_expiry(&self, id: u32) {
@@ -350,11 +462,12 @@ impl Services {
   }
 
   pub fn invoke(self: &Rc<Self>, id: u32, action: &str) {
-    let model = self.model.borrow();
-    let Some(notice) = model.notices.iter().find(|notice| notice.id == id) else {
+    let mut model = self.model.borrow_mut();
+    let Some(notice) = model.notices.iter_mut().find(|notice| notice.id == id) else {
       return;
     };
     if notice.live && notice.actions.iter().any(|(key, _)| key == action) {
+      notice.seen = true;
       let resident = notice.resident;
       drop(model);
       let result = self.bus.emit_signal(
@@ -366,6 +479,8 @@ impl Services {
       );
       if result.is_ok() && !resident {
         self.finish_notice(id, 2, false);
+      } else {
+        (self.refresh)();
       }
     }
   }

@@ -945,7 +945,11 @@ pub fn decode_art(bytes: Vec<u8>, size: u32) -> Option<Art> {
   limits.max_image_height = Some(2048);
   limits.max_alloc = Some(20 << 20);
   reader.limits(limits);
-  let pixels = reader.decode().ok()?.thumbnail(size, size).into_rgba8();
+  Some(thumbnail_art(reader.decode().ok()?, size))
+}
+
+pub fn thumbnail_art(image: image::DynamicImage, size: u32) -> Art {
+  let pixels = image.thumbnail(size, size).into_rgba8();
   let (width, height) = (pixels.width() as i32, pixels.height() as i32);
   let mut data = pixels.into_raw();
   for px in data.chunks_exact_mut(4) {
@@ -955,9 +959,9 @@ pub fn decode_art(bytes: Vec<u8>, size: u32) -> Option<Art> {
       *channel = (u16::from(*channel) * alpha / 255) as u8;
     }
   }
-  Some(Art {
+  Art {
     data,
     width,
     height,
-  })
+  }
 }

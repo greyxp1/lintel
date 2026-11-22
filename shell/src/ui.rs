@@ -77,6 +77,8 @@ pub struct Notice {
   pub actions: Vec<(String, String)>,
   pub live: bool,
   pub popup: bool,
+  pub seen: bool,
+  pub image: Option<ImageSurface>,
   pub transient: bool,
   pub resident: bool,
   pub countdown: Option<Countdown>,
@@ -233,6 +235,7 @@ pub enum Action {
   Volume(Slider, Option<u8>),
   ToggleMic,
   ToggleMonitor,
+  ToggleDoNotDisturb,
   Close(u32),
   PopupHover,
   Invoke(u32, String),
@@ -328,6 +331,7 @@ impl Hover {
 pub struct Model {
   pub track: Track,
   pub notices: VecDeque<Notice>,
+  pub do_not_disturb: bool,
   pub trays: Vec<TrayItem>,
   pub panel: Panel,
   pub playlists: Vec<Playlist>,
@@ -520,6 +524,9 @@ impl Model {
   }
 
   pub fn select(&mut self, panel: Panel) {
+    if self.panel == Panel::History && panel != Panel::History {
+      self.mark_visible_notices_seen();
+    }
     self.panel = panel;
     self.audio_hover = Default::default();
     self.offset = 0;
@@ -564,7 +571,7 @@ impl Model {
       self.panel,
       Panel::History | Panel::Tray | Panel::Music | Panel::Audio
     ) {
-      self.offset = if amount > 0.0 {
+      let offset = if amount > 0.0 {
         (self.offset + 1).min(self.count().saturating_sub(
           if self.panel == Panel::Music && self.music_tab == MusicTab::Lyrics {
             1
@@ -575,6 +582,10 @@ impl Model {
       } else {
         self.offset.saturating_sub(1)
       };
+      if self.panel == Panel::History && offset != self.offset {
+        self.mark_visible_notices_seen();
+      }
+      self.offset = offset;
     }
   }
 
@@ -588,6 +599,18 @@ impl Model {
 
   fn history(&self) -> impl Iterator<Item = &Notice> {
     self.notices.iter().filter(|notice| !notice.transient)
+  }
+
+  fn mark_visible_notices_seen(&mut self) {
+    for notice in self
+      .notices
+      .iter_mut()
+      .filter(|notice| !notice.transient)
+      .skip(self.offset)
+      .take(VISIBLE_ROWS)
+    {
+      notice.seen = true;
+    }
   }
 
   pub fn hover_popup(&mut self, pointer: Option<(f64, f64)>) -> bool {
@@ -935,6 +958,9 @@ impl Model {
     }
     if y < HEIGHT {
       if (HISTORY_X..TRAY_X).contains(&x) {
+        if right {
+          return Some(Action::ToggleDoNotDisturb);
+        }
         self.select(if self.panel == Panel::History {
           Panel::None
         } else {
@@ -1157,6 +1183,12 @@ impl Model {
       }
       return None;
     }
+    if self.panel == Panel::History
+      && !right
+      && inside(Some((x.into(), y.into())), DND_X, PANEL_Y + 5, 132, 26)
+    {
+      return Some(Action::ToggleDoNotDisturb);
+    }
     let row = y - PANEL_Y - 34;
     if row < 0 {
       return None;
@@ -1164,11 +1196,16 @@ impl Model {
     let row = self.offset + (row / ROW_HEIGHT) as usize;
     match self.panel {
       Panel::History => {
-        let notice = self.history().nth(row)?;
+        let notice = self
+          .notices
+          .iter_mut()
+          .filter(|notice| !notice.transient)
+          .nth(row)?;
         let end = PANEL_X + PANEL_WIDTH - 36 + POPUP_CLOSE_SIZE;
         if right || (end - POPUP_CLOSE_SIZE..end).contains(&x) {
           Some(Action::Close(notice.id))
         } else {
+          notice.seen = true;
           notice.activate()
         }
       }
@@ -1190,6 +1227,7 @@ impl Model {
 
 const SLIDER_X: i32 = PANEL_X + 135;
 const MONITOR_X: i32 = PANEL_X + PANEL_WIDTH - 40;
+const DND_X: i32 = PANEL_X + PANEL_WIDTH - 144;
 fn monitor_hit(pointer: Option<(f64, f64)>) -> bool {
   inside(pointer, MONITOR_X, PANEL_Y + 5, 28, 28)
 }
@@ -1271,7 +1309,7 @@ fn sign_out_symbol(cr: &Context, x: f64, y: f64) -> cairo::Result<()> {
   cr.stroke()
 }
 
-fn app_icon(name: &str) -> Option<ImageSurface> {
+pub fn app_icon(name: &str) -> Option<ImageSurface> {
   if name.is_empty() || name.contains('/') || name == "." || name == ".." {
     return None;
   }
@@ -2325,6 +2363,36 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       Weight::Semibold,
       Alignment::Left,
     );
+    let dnd_y = PANEL_Y + 5;
+    let hovered = inside(model.bar_pointer, DND_X, dnd_y, 132, 26);
+    round(cr, DND_X, dnd_y, 132, 26, 6.0);
+    color(
+      cr,
+      if model.do_not_disturb {
+        0xcba6f7
+      } else {
+        0xcdd6f4
+      },
+      if hovered { 0.26 } else { 0.14 },
+    );
+    cr.fill()?;
+    color(
+      cr,
+      if model.do_not_disturb {
+        0xcba6f7
+      } else {
+        0xcdd6f4
+      },
+      1.0,
+    );
+    label(
+      cr,
+      "Do Not Disturb",
+      (DND_X, dnd_y + 5, 132),
+      12,
+      Weight::Semibold,
+      Alignment::Center,
+    );
     for (row, notice) in model
       .history()
       .skip(model.offset)
@@ -2352,11 +2420,29 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
         color(cr, 0xcba6f7, 0.12);
         cr.fill()?;
       }
-      color(cr, 0xcdd6f4, 1.0);
+      if !notice.seen {
+        color(cr, 0xcba6f7, 1.0);
+        cr.arc(
+          f64::from(left + 2),
+          f64::from(y + 8),
+          2.5,
+          0.0,
+          std::f64::consts::TAU,
+        );
+        cr.fill()?;
+      }
+      let text_x = if let Some(icon) = &notice.image {
+        picture(cr, Some(icon), left + 12, y + 2, 27, "")?;
+        left + 47
+      } else {
+        left + 12
+      };
+      let text_width = dismiss_x - text_x - 4;
+      color(cr, if notice.seen { 0xa6adc8 } else { 0xcdd6f4 }, 1.0);
       label(
         cr,
         &notice.summary,
-        (left, y, PANEL_WIDTH - 52),
+        (text_x, y, text_width),
         13,
         Weight::Semibold,
         Alignment::Left,
@@ -2365,7 +2451,7 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       label(
         cr,
         &notice.body,
-        (left, y + 16, PANEL_WIDTH - 52),
+        (text_x, y + 16, text_width),
         11,
         Weight::Normal,
         Alignment::Left,
@@ -2468,11 +2554,17 @@ fn paint_popup(
   color(cr, 0xcba6f7, 0.46);
   cr.set_line_width(1.0);
   cr.stroke()?;
+  let text_x = if let Some(icon) = &notice.image {
+    picture(cr, Some(icon), 14, 14, 42, "")?;
+    65
+  } else {
+    14
+  };
   color(cr, 0xcdd6f4, 1.0);
   label(
     cr,
     &notice.summary,
-    (14, 13, POPUP_WIDTH - 52),
+    (text_x, 13, POPUP_WIDTH - text_x - 38),
     16,
     Weight::Semibold,
     Alignment::Left,
@@ -2489,7 +2581,7 @@ fn paint_popup(
     label(
       cr,
       line,
-      (14, 40 + row as i32 * 18, POPUP_WIDTH - 28),
+      (text_x, 40 + row as i32 * 18, POPUP_WIDTH - text_x - 14),
       14,
       Weight::Normal,
       Alignment::Left,
@@ -2691,6 +2783,17 @@ fn paint_bar_header(cr: &Context, model: &Model) -> cairo::Result<()> {
   cr.stroke()?;
   cr.arc(bell, 26.0, 1.0, 0.0, std::f64::consts::TAU);
   cr.fill()?;
+  if model.do_not_disturb {
+    cr.move_to(bell - 8.0, 27.0);
+    cr.line_to(bell + 8.0, 12.0);
+    cr.stroke()?;
+  }
+  if model.history().any(|notice| !notice.seen) {
+    color(cr, 0xcba6f7, 1.0);
+    cr.arc(bell + 9.0, 12.0, 2.5, 0.0, std::f64::consts::TAU);
+    cr.fill()?;
+    color(cr, 0xcdd6f4, 1.0);
+  }
   let tray = f64::from(TRAY_X + UTILITY_WIDTH / 2);
   for dx in [-6.0, 1.0] {
     for y in [14.0, 21.0] {
