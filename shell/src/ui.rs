@@ -229,6 +229,7 @@ pub enum Action {
 pub enum Slider {
   Device(Device),
   Stream(StreamId),
+  Music(StreamId),
 }
 
 impl Slider {
@@ -236,6 +237,7 @@ impl Slider {
     match self {
       Self::Device(_) => AUDIO_NAME_X,
       Self::Stream(_) => SLIDER_X,
+      Self::Music(_) => PLAYER_X + 32,
     }
   }
 
@@ -407,17 +409,39 @@ impl Model {
     self.hover.iter().any(Hover::animating) || self.sign_in_hover.animating()
   }
 
-  pub fn set_streams(&mut self, streams: Vec<Stream>) {
-    self
-      .icons
-      .retain(|name, _| streams.iter().any(|stream| stream.icon == *name));
-    for stream in &streams {
+  pub fn set_streams(&mut self, streams: Vec<Stream>, music_only: bool) -> bool {
+    if music_only {
+      if self.music_stream() == streams.first() {
+        return false;
+      }
+      self.streams.retain(|stream| !stream.music);
+      self.streams.extend(streams);
+      return true;
+    }
+    if self.streams == streams {
+      return false;
+    }
+    self.icons.retain(|name, _| {
+      streams
+        .iter()
+        .any(|stream| !stream.music && stream.icon == *name)
+    });
+    for stream in streams.iter().filter(|stream| !stream.music) {
       self
         .icons
         .entry(stream.icon.clone())
         .or_insert_with(|| app_icon(&stream.icon));
     }
     self.streams = streams;
+    true
+  }
+
+  fn music_stream(&self) -> Option<&Stream> {
+    self.streams.iter().find(|stream| stream.music)
+  }
+
+  fn app_streams(&self) -> impl Iterator<Item = &Stream> {
+    self.streams.iter().filter(|stream| !stream.music)
   }
 
   fn volume(&self, target: Slider, volume: Option<Volume>) -> Option<Volume> {
@@ -455,7 +479,7 @@ impl Model {
         MusicTab::Lyrics => self.lyrics_lines.len(),
         MusicTab::Search => self.search_results.len(),
       },
-      Panel::Audio => self.streams.len(),
+      Panel::Audio => self.app_streams().count(),
       _ => 0,
     }
   }
@@ -541,7 +565,7 @@ impl Model {
     let volume = match target {
       Slider::Device(Device::Output) => self.output.as_mut(),
       Slider::Device(Device::Input) => self.input.as_mut(),
-      Slider::Stream(id) => self
+      Slider::Stream(id) | Slider::Music(id) => self
         .streams
         .iter_mut()
         .find(|stream| stream.id == id)
@@ -616,7 +640,12 @@ impl Model {
       MusicTab::Lyrics => TAB_END,
       MusicTab::Search => RESULTS_Y + rows * RESULTS_ROW,
     };
-    (TRANSPORT_END + if self.music_status().is_some() { 19 } else { 0 }).max(list_end) + 8
+    let player_end = self.music_volume_y() + if self.music_stream().is_some() { 18 } else { 0 };
+    player_end.max(list_end) + 8
+  }
+
+  fn music_volume_y(&self) -> i32 {
+    TRANSPORT_END + if self.music_status().is_some() { 19 } else { 0 }
   }
 
   pub fn visible_playlists(&self) -> impl Iterator<Item = &Playlist> {
@@ -673,6 +702,9 @@ impl Model {
   }
 
   pub fn update_track(&mut self, track: Track) {
+    if self.track.player_pid != track.player_pid {
+      self.streams.retain(|stream| !stream.music);
+    }
     if self
       .queue_drag
       .as_ref()
@@ -863,14 +895,22 @@ impl Model {
           let row = self.offset.min(self.count().saturating_sub(VISIBLE_ROWS))
             + ((y - APP_AUDIO_Y) / ROW_HEIGHT) as usize;
           self
-            .streams
-            .get(row)
+            .app_streams()
+            .nth(row)
             .and_then(|stream| Slider::Stream(stream.id).pick(x, right))
         }
         _ => None,
       };
     }
     if self.panel == Panel::Music {
+      let volume_y = self.music_volume_y();
+      if self.signed_in
+        && (PLAYER_X + 8..PANEL_X + PANEL_WIDTH - 8).contains(&x)
+        && (volume_y..volume_y + 22).contains(&y)
+        && let Some(stream) = self.music_stream()
+      {
+        return Slider::Music(stream.id).pick(x, right);
+      }
       if right || !(PANEL_X..PANEL_X + PANEL_WIDTH).contains(&x) {
         return None;
       }
@@ -1861,6 +1901,18 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       );
     }
 
+    if let Some(stream) = model.music_stream() {
+      let y = model.music_volume_y() + 7;
+      color(cr, 0xcdd6f4, 1.0);
+      paint_speaker(cr, f64::from(PLAYER_X + 18), f64::from(y + 4))?;
+      let slider = Slider::Music(stream.id);
+      draw_volume(
+        cr,
+        y,
+        slider,
+        model.volume(slider, Some(stream.volume)).as_ref(),
+      )?;
+    }
     paint_music_library(cr, model, left)?;
     if let Some(removal) = &model.removal {
       let confirm_y = model.music_body_bottom() + 22;
@@ -1941,7 +1993,7 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       Weight::Semibold,
       Alignment::Left,
     );
-    if model.streams.is_empty() {
+    if model.count() == 0 {
       label(
         cr,
         "No active audio streams",
@@ -1953,8 +2005,7 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
     }
     let offset = model.offset.min(model.count().saturating_sub(VISIBLE_ROWS));
     for (row, stream) in model
-      .streams
-      .iter()
+      .app_streams()
       .skip(offset)
       .take(VISIBLE_ROWS)
       .enumerate()

@@ -24,7 +24,7 @@ impl Device {
   }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Volume {
   pub percent: u8,
   pub muted: bool,
@@ -36,17 +36,22 @@ pub struct StreamId {
   pub recording: bool,
 }
 
+#[derive(PartialEq, Eq)]
 pub struct Stream {
   pub id: StreamId,
   pub members: Vec<StreamId>,
   pub name: String,
   pub icon: String,
   pub volume: Volume,
+  pub music: bool,
 }
 
-pub fn streams() -> Vec<Stream> {
+pub fn streams(player: u32, music_only: bool) -> Vec<Stream> {
   let mut streams: Vec<Stream> = Vec::new();
   for (kind, recording) in [("sink-inputs", false), ("source-outputs", true)] {
+    if music_only && (recording || player == 0) {
+      break;
+    }
     let Ok(output) = Command::new("pactl")
       .args(["--format=json", "list", kind])
       .output()
@@ -59,6 +64,15 @@ pub fn streams() -> Vec<Stream> {
     for stream in items.into_iter().filter_map(|item| {
       let index = u32::try_from(item["index"].as_u64()?).ok()?;
       let properties = &item["properties"];
+      let music = !recording
+        && player != 0
+        && properties["application.process.id"]
+          .as_str()
+          .and_then(|pid| pid.parse().ok())
+          == Some(player);
+      if music_only && !music {
+        return None;
+      }
       if properties["node.passive"].as_str() == Some("true")
         || (item["client"].is_null() && properties["media.role"].as_str() == Some("production"))
       {
@@ -94,10 +108,13 @@ pub fn streams() -> Vec<Stream> {
           percent,
           muted: item["mute"].as_bool().unwrap_or(false),
         },
+        music,
       })
     }) {
       if let Some(group) = streams.iter_mut().find(|group| {
-        group.id.recording == recording && group.name.eq_ignore_ascii_case(&stream.name)
+        group.id.recording == recording
+          && group.music == stream.music
+          && (stream.music || group.name.eq_ignore_ascii_case(&stream.name))
       }) {
         group.members.push(stream.id);
         if stream.id.index < group.id.index {

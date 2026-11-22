@@ -325,6 +325,7 @@ fn run() -> Result<()> {
               redraw();
             }
             watch_music_clock(&model, &redraw);
+            watch_audio(&model, &redraw);
             fetch_art(&model, &redraw);
             fetch_small_covers(&model, &redraw);
             let lyrics = {
@@ -770,14 +771,14 @@ fn watch_music_clock(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
 }
 
 fn watch_audio(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
+  refresh_audio(model, refresh);
   if std::mem::replace(&mut model.borrow_mut().audio_watching, true) {
     return;
   }
-  refresh_audio(model, refresh);
   let model = model.clone();
   let refresh = refresh.clone();
   glib::timeout_add_local(Duration::from_secs(1), move || {
-    if model.borrow().panel != Panel::Audio {
+    if !matches!(model.borrow().panel, Panel::Music | Panel::Audio) {
       model.borrow_mut().audio_watching = false;
       return ControlFlow::Break;
     }
@@ -848,7 +849,7 @@ fn write_volume(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
     AudioChange::OutputStep(_) => None,
   };
   let group = match target {
-    Slider::Stream(id) => state
+    Slider::Stream(id) | Slider::Music(id) => state
       .streams
       .iter()
       .find(|stream| stream.id == id)
@@ -863,7 +864,7 @@ fn write_volume(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
     move || match (target, change) {
       (_, AudioChange::OutputStep(step)) => audio::step_output(step).map(Some),
       (Slider::Device(device), _) => audio::set(device, value).map(Some),
-      (Slider::Stream(_), _) => {
+      (Slider::Stream(_) | Slider::Music(_), _) => {
         let Some((members, muted)) = group else {
           return Ok(None);
         };
@@ -911,7 +912,9 @@ fn write_volume(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
 
 fn refresh_audio(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   let state = model.borrow();
-  if state.audio_setting {
+  let music_only = state.panel == Panel::Music;
+  let player = state.track.player_pid;
+  if state.audio_setting || (music_only && (!state.signed_in || player == 0)) {
     return;
   }
   let revision = state.audio_revision;
@@ -919,23 +922,34 @@ fn refresh_audio(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   let model = model.clone();
   let refresh = refresh.clone();
   background(
-    || {
-      (
-        audio::get(Device::Output).ok(),
-        audio::get(Device::Input).ok(),
-        audio::streams(),
-      )
+    move || {
+      let devices = (!music_only).then(|| {
+        (
+          audio::get(Device::Output).ok(),
+          audio::get(Device::Input).ok(),
+        )
+      });
+      (devices, audio::streams(player, music_only))
     },
-    move |(output, input, streams)| {
+    move |(devices, streams)| {
       let mut state = model.borrow_mut();
-      if state.audio_revision != revision {
+      if state.audio_revision != revision
+        || state.track.player_pid != player
+        || (state.panel == Panel::Music) != music_only
+      {
         return;
       }
-      state.output = output;
-      state.input = input;
-      state.set_streams(streams);
+      let changed = devices.is_some_and(|(output, input)| {
+        let changed = state.output != output || state.input != input;
+        state.output = output;
+        state.input = input;
+        changed
+      });
+      let streams_changed = state.set_streams(streams, music_only);
       drop(state);
-      refresh();
+      if changed || streams_changed {
+        refresh();
+      }
     },
   );
 }
