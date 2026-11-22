@@ -538,34 +538,50 @@ fn run() -> Result<()> {
           }
           Action::RemoveSong(removal) => {
             let mut state = model.borrow_mut();
-            if state.playlist_busy
-              || !state.signed_in
-              || state
-                .selected_playlist
-                .as_ref()
-                .is_none_or(|list| list.id != removal.playlist)
-            {
+            let Some(previous) = state
+              .selected_playlist
+              .clone()
+              .filter(|list| list.id == removal.playlist)
+            else {
+              continue;
+            };
+            if state.playlist_busy || !state.signed_in {
               continue;
             }
-            let playlist = removal.playlist;
             let song = removal.song;
+            let queue = state.track.queue.clone();
+            state.playlist_epoch = state.playlist_epoch.wrapping_add(1);
+            let epoch = state.playlist_epoch;
+            state.playlist_syncing = false;
             state.playlist_busy = true;
             state.playlist_error = None;
             drop(state);
+            redraw();
             let socket = socket.clone();
+            let player = socket.clone();
             let model = model.clone();
             let redraw = redraw.clone();
             background(
-              move || media::remove_song(&playlist, &song).map_err(|error| error.to_string()),
+              move || {
+                media::remove_song(&player, previous, queue, &song)
+                  .map_err(|error| error.to_string())
+              },
               move |result| {
                 let mut state = model.borrow_mut();
+                if state.playlist_epoch != epoch {
+                  return;
+                }
                 state.playlist_busy = false;
-                if let Err(error) = result {
-                  state.playlist_error = Some(error);
+                match result {
+                  Ok(playlist) => {
+                    state.selected_playlist = Some(playlist);
+                    media::save_playlist(state.selected_playlist.as_ref());
+                  }
+                  Err(error) => state.playlist_error = Some(error),
                 }
                 drop(state);
                 redraw();
-                refresh_active(&model, &redraw, &socket);
+                watch_playlist(model, redraw, socket, epoch, 15);
               },
             );
           }

@@ -500,6 +500,13 @@ struct PlaylistReply {
   songs: Vec<Song>,
 }
 
+impl PlaylistReply {
+  fn into_playlist(mut self) -> (Playlist, Vec<Song>) {
+    self.playlist.songs = self.songs.iter().map(|song| song.id.clone()).collect();
+    (self.playlist, self.songs)
+  }
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 struct Status {
@@ -645,9 +652,7 @@ fn load_playlist(
   if first_page {
     args.push("--first-page");
   }
-  let mut result: PlaylistReply = library_request(&args)?;
-  result.playlist.songs = result.songs.iter().map(|song| song.id.clone()).collect();
-  Ok((result.playlist, result.songs))
+  Ok(library_request::<PlaylistReply>(&args)?.into_playlist())
 }
 
 pub struct PreparedPlaylist {
@@ -783,36 +788,53 @@ pub fn refresh_playlist(
   queue: Arc<Vec<String>>,
 ) -> MediaResult<Playlist> {
   let (playlist, songs) = load_playlist(&previous.id, false, false)?;
+  sync_playlist_queue(socket, &previous, &playlist, &queue, songs)?;
+  Ok(playlist)
+}
+
+fn sync_playlist_queue(
+  socket: &Path,
+  previous: &Playlist,
+  playlist: &Playlist,
+  queue: &[String],
+  songs: Vec<Song>,
+) -> MediaResult<()> {
+  let old_ids: HashSet<_> = previous.songs.iter().collect();
+  let new_ids: HashSet<_> = playlist.songs.iter().collect();
+  // Adapt the playing queue only if it still represents this playlist.
+  if old_ids == new_ids
+    || old_ids.len() != queue.len()
+    || !queue.iter().all(|id| old_ids.contains(id))
+  {
+    return Ok(());
+  }
   catalog_call(socket, |call| {
-    let old_ids: HashSet<_> = previous.songs.iter().collect();
-    let new_ids: HashSet<_> = playlist.songs.iter().collect();
-    // Adapt the playing queue only if it still represents this playlist.
-    if old_ids != new_ids
-      && old_ids.len() == queue.len()
-      && queue.iter().all(|id| old_ids.contains(id))
-    {
-      call(
-        Call {
-          method: SYNC_PLAYLIST_QUEUE,
-          ids: Some(QueueSelection {
-            ids: playlist.songs.clone(),
-            expected: queue.as_ref().clone(),
-            start: 0,
-            ordered: false,
-            position: 0.0,
-          }),
-          ..Call::default()
-        },
-        songs,
-      )?;
-    }
-    Ok(playlist)
+    call(
+      Call {
+        method: SYNC_PLAYLIST_QUEUE,
+        ids: Some(QueueSelection {
+          ids: playlist.songs.clone(),
+          expected: queue.to_vec(),
+          start: 0,
+          ordered: false,
+          position: 0.0,
+        }),
+        ..Call::default()
+      },
+      songs,
+    )?;
+    Ok(())
   })
 }
 
-pub fn remove_song(playlist: &str, song: &str) -> MediaResult<()> {
+pub fn remove_song(
+  socket: &Path,
+  previous: Playlist,
+  queue: Arc<Vec<String>>,
+  song: &str,
+) -> MediaResult<Playlist> {
   let output = Command::new("lintel-ytmusic")
-    .args(["remove", playlist, song])
+    .args(["remove", previous.id.as_str(), song])
     .output()?;
   if !output.status.success() {
     return Err(
@@ -822,7 +844,12 @@ pub fn remove_song(playlist: &str, song: &str) -> MediaResult<()> {
         .into(),
     );
   }
-  Ok(())
+  let (playlist, songs) = serde_json::from_slice::<PlaylistReply>(&output.stdout)?.into_playlist();
+  // The remote edit has already succeeded even if the local queue changed.
+  if let Err(error) = sync_playlist_queue(socket, &previous, &playlist, &queue, songs) {
+    eprintln!("Playlist queue: {error}");
+  }
+  Ok(playlist)
 }
 
 pub fn search(query: &str) -> MediaResult<Vec<Song>> {

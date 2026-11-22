@@ -12,6 +12,7 @@ import tempfile
 import time
 
 from ytmusicapi import OAuthCredentials, YTMusic
+from ytmusicapi.exceptions import YTMusicServerError
 
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "lintel"
@@ -273,26 +274,71 @@ def song(item):
     }
 
 
+def fetch_playlist(yt, playlist_id, first_page=False):
+    result = yt.get_playlist(playlist_id, limit=1 if first_page else None)
+    return {
+        "Playlist": {
+            **playlist({**result, "playlistId": playlist_id}),
+            "Partial": first_page,
+        },
+        "Songs": [
+            {**song(item), "SetVideoId": item.get("setVideoId")}
+            for item in result["tracks"]
+            if item.get("videoId") and item.get("isAvailable", True)
+        ],
+    }
+
+
+def save_playlist(path, reply):
+    try:
+        save_json(path, reply)
+    except OSError:
+        pass
+
+
+def remove_song(yt, playlist_id, video_id):
+    path = cache_file(playlist_id)
+    cached = cached_playlist(path)
+    if cached is not None and remove_entry(yt, playlist_id, video_id, cached):
+        save_playlist(path, cached)
+        return cached
+    fresh = fetch_playlist(yt, playlist_id)
+    if not remove_entry(yt, playlist_id, video_id, fresh):
+        raise PlaylistEditError("The track is missing or this playlist isn’t editable.")
+    save_playlist(path, fresh)
+    return fresh
+
+
+def remove_entry(yt, playlist_id, video_id, reply):
+    songs = reply["Songs"]
+    for index, entry in enumerate(songs):
+        if entry["ID"] != video_id or not entry.get("SetVideoId"):
+            continue
+        try:
+            result = yt.remove_playlist_items(playlist_id, [{
+                "videoId": video_id,
+                "setVideoId": entry["SetVideoId"],
+            }])
+        except YTMusicServerError as error:
+            if str(error).startswith(("Server returned HTTP 400:", "Server returned HTTP 404:")):
+                return False
+            raise
+        status = result.get("status") if isinstance(result, dict) else result
+        if status == "STATUS_SUCCEEDED":
+            songs.pop(index)
+            return True
+        return False
+    return False
+
+
 def handle(yt, args):
     if args.command == "library":
         return [playlist(item) for item in library_playlists(yt)
                 if item.get("playlistId")]
     if args.command == "playlist":
-        result = yt.get_playlist(args.playlist_id, limit=1 if args.first_page else None)
-        songs = [song(item) for item in result["tracks"]
-                 if item.get("videoId") and item.get("isAvailable", True)]
-        reply = {
-            "Playlist": {
-                **playlist({**result, "playlistId": args.playlist_id}),
-                "Partial": args.first_page,
-            },
-            "Songs": songs,
-        }
+        reply = fetch_playlist(yt, args.playlist_id, args.first_page)
         if not args.first_page:
-            try:
-                save_json(cache_file(args.playlist_id), reply)
-            except OSError:
-                pass
+            save_playlist(cache_file(args.playlist_id), reply)
         return reply
     if args.command == "search":
         return [song(item) for item in yt.search(args.query, filter="songs", limit=20)
@@ -300,18 +346,9 @@ def handle(yt, args):
     if args.command == "lyrics":
         lyrics_id = yt.get_watch_playlist(videoId=args.video_id).get("lyrics")
         return yt.get_lyrics(lyrics_id) if lyrics_id else None
-    if args.command == "add":
-        result = yt.add_playlist_items(args.playlist_id, [args.video_id])
-    else:
-        tracks = yt.get_playlist(args.playlist_id, limit=None)["tracks"]
-        entry = next((item for item in tracks
-                      if item.get("videoId") == args.video_id and item.get("setVideoId")), None)
-        if entry is None:
-            raise PlaylistEditError("The track is missing or this playlist isn’t editable.")
-        result = yt.remove_playlist_items(args.playlist_id, [{
-            "videoId": args.video_id,
-            "setVideoId": entry["setVideoId"],
-        }])
+    if args.command == "remove":
+        return remove_song(yt, args.playlist_id, args.video_id)
+    result = yt.add_playlist_items(args.playlist_id, [args.video_id])
     status = result.get("status") if isinstance(result, dict) else result
     if status != "STATUS_SUCCEEDED":
         raise PlaylistEditError("YouTube Music rejected the playlist change.")
