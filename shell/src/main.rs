@@ -229,12 +229,38 @@ fn run() -> Result<()> {
           }
           Action::DismissBar => {
             let mut state = model.borrow_mut();
-            if state.panel != Panel::None {
+            if state.dismiss_confirmation() {
+              drop(state);
+              redraw();
+            } else if state.panel != Panel::None {
               state.select(Panel::None);
               state.bar_visible = false;
               drop(state);
               redraw();
             }
+          }
+          Action::BarFocusLost => {
+            let generation = {
+              let state = model.borrow();
+              if state.bar_hovered() {
+                continue;
+              }
+              state.pointer_generation
+            };
+            let model = model.clone();
+            let redraw = redraw.clone();
+            glib::timeout_add_local_once(Duration::from_millis(90), move || {
+              let mut state = model.borrow_mut();
+              if state.pointer_generation == generation
+                && !state.bar_hovered()
+                && state.panel != Panel::None
+              {
+                state.select(Panel::None);
+                state.bar_visible = false;
+                drop(state);
+                redraw();
+              }
+            });
           }
           Action::MusicTab(tab) => {
             if tab == MusicTab::Lyrics {
@@ -324,7 +350,7 @@ fn run() -> Result<()> {
               model.borrow_mut().set_library(&pinned, playlists);
               redraw();
             }
-            watch_music_clock(&model, &redraw);
+            watch_music_clock(&model, &display_events);
             watch_audio(&model, &redraw);
             fetch_art(&model, &redraw);
             fetch_small_covers(&model, &redraw);
@@ -764,22 +790,26 @@ async fn watch_tracks(
   }
 }
 
-fn watch_music_clock(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
+fn watch_music_clock(model: &Rc<RefCell<Model>>, display: &Rc<Display>) {
   if std::mem::replace(&mut model.borrow_mut().music_clock, true) {
     return;
   }
   let model = model.clone();
-  let refresh = refresh.clone();
+  let display = display.clone();
   glib::timeout_add_local(Duration::from_millis(250), move || {
     let mut state = model.borrow_mut();
     if state.panel != Panel::Music {
       state.music_clock = false;
       return ControlFlow::Break;
     }
-    let animate = state.signed_in && state.track.progressing_since.is_some();
+    let animate = state.timeline_animating();
     drop(state);
     if animate {
-      refresh();
+      display
+        .desktop
+        .borrow_mut()
+        .repaint_bar(ui::BarRegion::Timeline);
+      display.draw(false);
     }
     ControlFlow::Continue
   });

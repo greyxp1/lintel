@@ -22,17 +22,18 @@ const BUTTON_WIDTH: i32 = 32;
 const PLAYLIST_WIDTH: i32 = 149;
 const PLAYER_X: i32 = PANEL_X + PLAYLIST_WIDTH;
 const PLAYER_WIDTH: i32 = PANEL_WIDTH - PLAYLIST_WIDTH;
-const TRANSPORT_X: i32 = PLAYER_X + (PLAYER_WIDTH - 4 * BUTTON_WIDTH) / 2;
+const TRANSPORT_X: i32 = PLAYER_X + (PLAYER_WIDTH - 3 * BUTTON_WIDTH) / 2;
 const SEEK_Y: i32 = 236;
 const TRANSPORT_Y: i32 = 249;
 const TAB_Y: i32 = PANEL_Y + 10;
 const TAB_START: i32 = PANEL_X + 9;
 const TAB_WIDTH: i32 = 26;
 const LIST_Y: i32 = PANEL_Y + 48;
-const TAB_END: i32 = LIST_Y + ROW_HEIGHT * VISIBLE_ROWS as i32;
+const TAB_END: i32 = TRANSPORT_END;
 const RESULTS_Y: i32 = LIST_Y + 37;
-const RESULTS_ROW: i32 = 33;
+const RESULTS_ROW: i32 = 32;
 const QUEUE_ROW: i32 = 33;
+const PLAYLIST_ROW: i32 = 38;
 const TRANSPORT_END: i32 = PANEL_Y + TRANSPORT_Y + 30;
 pub const CORNER_SIZE: i32 = 20;
 pub const PANEL_WIDTH: i32 = WIDTH - 2 * WING;
@@ -54,7 +55,8 @@ const SIGN_IN_X: i32 = PANEL_X + 16;
 const SIGN_IN_Y: i32 = PANEL_Y + 12;
 const SIGN_IN_WIDTH: i32 = PANEL_WIDTH - 32;
 const SIGN_IN_BUTTON_HEIGHT: i32 = 38;
-const TAB_SIGN_OUT_X: i32 = TAB_START + 4 * TAB_WIDTH;
+const PLAYER_SIGN_OUT_X: i32 = PLAYER_X + 15;
+const PLAYER_REMOVE_X: i32 = PLAYER_X + PLAYER_WIDTH - TAB_WIDTH - 15;
 const SIGN_OUT_WIDTH: i32 = 38;
 const RECONNECT_WIDTH: i32 = SIGN_IN_WIDTH - SIGN_OUT_WIDTH - 8;
 const VOLUME_FEEDBACK_HEIGHT: i32 = 32;
@@ -177,6 +179,11 @@ pub struct Removal {
   title: String,
 }
 
+enum MusicConfirmation {
+  Remove(Removal),
+  SignOut,
+}
+
 struct QueueDrag {
   expected: Arc<Vec<String>>,
   playing: usize,
@@ -219,6 +226,7 @@ pub enum Action {
   Search(String),
   PlayResult(Song),
   DismissBar,
+  BarFocusLost,
   SignIn,
   SignOut,
   HideBar(u64),
@@ -345,7 +353,7 @@ pub struct Model {
   pub lyrics_status: Option<String>,
   seek_preview: Option<(String, f64)>,
   queue_drag: Option<QueueDrag>,
-  removal: Option<Removal>,
+  confirmation: Option<MusicConfirmation>,
   pub signed_in: bool,
   pub library_checked: bool,
   pub reconnect: bool,
@@ -416,15 +424,32 @@ impl Model {
       && pointer.is_some_and(|(x, y)| self.sign_in_hit(x as i32, y as i32));
     changed |= self.sign_in_hover.update(sign_in);
     for (index, hover) in self.audio_hover.iter_mut().enumerate() {
-      changed |= hover.update(self.panel == Panel::Audio && audio_button_hit(pointer, index));
+      let active = match self.panel {
+        Panel::Audio => audio_button_hit(pointer, index),
+        Panel::Music if self.signed_in && self.confirmation.is_none() => {
+          if index == MusicChannel::Listen as usize {
+            music_headphones_hit(pointer)
+          } else {
+            self.music_mix && music_mic_hit(pointer)
+          }
+        }
+        _ => false,
+      };
+      changed |= hover.update(active);
     }
     changed
   }
 
-  pub fn hover_animating(&self) -> bool {
+  pub fn header_hover_animating(&self) -> bool {
     self.hover.iter().any(Hover::animating)
-      || self.sign_in_hover.animating()
-      || (self.panel == Panel::Audio && self.audio_hover.iter().any(Hover::animating))
+  }
+
+  pub fn panel_hover_animating(&self) -> bool {
+    self.sign_in_hover.animating() || self.audio_hover.iter().any(Hover::animating)
+  }
+
+  pub fn timeline_animating(&self) -> bool {
+    self.signed_in && self.confirmation.is_none() && self.track.progressing_since.is_some()
   }
 
   pub fn set_streams(&mut self, streams: Vec<Stream>, music_only: bool) -> bool {
@@ -490,10 +515,18 @@ impl Model {
     self.panel = panel;
     self.audio_hover = Default::default();
     self.offset = 0;
-    self.removal = None;
+    self.confirmation = None;
     self.seek_preview = None;
     self.queue_drag = None;
     self.slider_preview = None;
+  }
+
+  pub fn dismiss_confirmation(&mut self) -> bool {
+    self.confirmation.take().is_some()
+  }
+
+  pub fn bar_hovered(&self) -> bool {
+    self.bar_pointer.is_some()
   }
 
   fn count(&self) -> usize {
@@ -636,20 +669,13 @@ impl Model {
         SIGN_IN_Y
           + SIGN_IN_BUTTON_HEIGHT
           + 12
-          + if self.playlist_error.is_some() || self.signing_in {
+          + if self.playlist_error.is_some() && !self.signing_in && self.confirmation.is_none() {
             22
           } else {
             0
           }
       }
-      Panel::Music => {
-        let bottom = self.music_body_bottom();
-        if self.removal.is_some() {
-          bottom + 56
-        } else {
-          bottom
-        }
-      }
+      Panel::Music => TRANSPORT_END + 8,
       Panel::Audio => {
         let count = self.count().min(VISIBLE_ROWS) as i32;
         PANEL_Y
@@ -674,15 +700,12 @@ impl Model {
       .or(self.playlist_busy.then_some("Loading…"))
   }
 
-  fn music_body_bottom(&self) -> i32 {
-    let rows = self.count().min(VISIBLE_ROWS) as i32;
-    let list_end = match self.music_tab {
-      MusicTab::Playlists => LIST_Y + rows * ROW_HEIGHT,
-      MusicTab::Queue => LIST_Y + rows * QUEUE_ROW,
-      MusicTab::Lyrics => TAB_END,
-      MusicTab::Search => RESULTS_Y + rows * RESULTS_ROW,
-    };
-    (TRANSPORT_END + if self.music_status().is_some() { 19 } else { 0 }).max(list_end) + 8
+  fn confirmation_geometry(&self) -> (i32, i32, i32) {
+    if self.signed_in {
+      (PLAYER_X + 6, PANEL_Y + SEEK_Y - 2, PLAYER_WIDTH - 16)
+    } else {
+      (SIGN_IN_X, SIGN_IN_Y - 1, SIGN_IN_WIDTH)
+    }
   }
 
   pub fn visible_playlists(&self) -> impl Iterator<Item = &Playlist> {
@@ -806,7 +829,10 @@ impl Model {
   }
 
   pub fn search_keyboard(&self) -> bool {
-    self.panel == Panel::Music && self.signed_in && self.music_tab == MusicTab::Search
+    self.panel == Panel::Music
+      && self.signed_in
+      && self.music_tab == MusicTab::Search
+      && self.confirmation.is_none()
   }
 
   pub fn search_edited(&mut self) {
@@ -951,8 +977,28 @@ impl Model {
       };
     }
     if self.panel == Panel::Music {
+      if self.confirmation.is_some() {
+        let (left, top, width) = self.confirmation_geometry();
+        if !right && (top + 21..top + 45).contains(&y) && (left..left + width).contains(&x) {
+          let pending = self.confirmation.take();
+          if x >= left + width / 2 + 3 {
+            return pending.map(|pending| match pending {
+              MusicConfirmation::Remove(removal) => Action::RemoveSong(removal),
+              MusicConfirmation::SignOut => Action::SignOut,
+            });
+          }
+        }
+        return None;
+      }
       if self.signed_in && self.music_mix && !right && music_mic_hit(Some((x.into(), y.into()))) {
         return Some(Action::ToggleMic);
+      }
+      if self.signed_in
+        && !right
+        && music_headphones_hit(Some((x.into(), y.into())))
+        && let Some((slider, _)) = self.music_slider(MusicChannel::Listen)
+      {
+        return Some(Action::Volume(slider, None));
       }
       if self.signed_in && (MUSIC_GAIN_TOP - 8..=MUSIC_GAIN_BOTTOM + 8).contains(&y) {
         for channel in MusicChannel::ALL {
@@ -982,7 +1028,8 @@ impl Model {
           && (SIGN_IN_X + RECONNECT_WIDTH + 8..SIGN_IN_X + SIGN_IN_WIDTH).contains(&x)
           && (SIGN_IN_Y..SIGN_IN_Y + SIGN_IN_BUTTON_HEIGHT).contains(&y)
         {
-          return Some(Action::SignOut);
+          self.confirmation = Some(MusicConfirmation::SignOut);
+          return None;
         }
         return (!self.library_refreshing && !self.playlist_busy && self.sign_in_hit(x, y))
           .then_some(Action::SignIn);
@@ -990,51 +1037,44 @@ impl Model {
       if !self.playlist_busy
         && inside(
           Some((f64::from(x), f64::from(y))),
-          TAB_SIGN_OUT_X,
-          TAB_Y,
+          PLAYER_SIGN_OUT_X,
+          PANEL_Y + TRANSPORT_Y,
           TAB_WIDTH,
           27,
         )
       {
-        return Some(Action::SignOut);
+        self.confirmation = Some(MusicConfirmation::SignOut);
+        return None;
       }
-      let confirm_y = self.music_body_bottom() + 22;
-      if self.removal.is_some() && (confirm_y..confirm_y + 24).contains(&y) {
-        let right = PANEL_X + PANEL_WIDTH;
-        let remove = (right - 92..right - 12).contains(&x);
-        let cancel = (right - 163..right - 100).contains(&x);
-        if remove || cancel {
-          let pending = self.removal.take();
-          return if remove {
-            pending.map(Action::RemoveSong)
-          } else {
-            None
-          };
-        }
+      if self.can_remove_song()
+        && inside(
+          Some((x.into(), y.into())),
+          PLAYER_REMOVE_X,
+          PANEL_Y + TRANSPORT_Y,
+          TAB_WIDTH,
+          27,
+        )
+      {
+        self.confirmation = self.selected_playlist.as_ref().map(|playlist| {
+          MusicConfirmation::Remove(Removal {
+            playlist: playlist.id.clone(),
+            song: self.track.id.clone(),
+            title: self.track.title.clone(),
+          })
+        });
+        return None;
       }
       let relative_y = y - PANEL_Y;
       let controls = x - TRANSPORT_X;
       if (TRANSPORT_Y..TRANSPORT_Y + 29).contains(&relative_y)
-        && (0..4 * BUTTON_WIDTH).contains(&controls)
+        && (0..3 * BUTTON_WIDTH).contains(&controls)
+        && self.track.has_track
       {
-        return match controls / BUTTON_WIDTH {
-          3 if self.can_remove_song() => {
-            self.removal = self.selected_playlist.as_ref().map(|playlist| Removal {
-              playlist: playlist.id.clone(),
-              song: self.track.id.clone(),
-              title: self.track.title.clone(),
-            });
-            None
-          }
-          index @ 0..=2 if self.track.has_track => {
-            let command = ["prev", "toggle", "next"][index as usize];
-            Some(Action::Media {
-              command,
-              rewind: index == 1 && self.track.at_end,
-            })
-          }
-          _ => None,
-        };
+        let index = (controls / BUTTON_WIDTH) as usize;
+        return Some(Action::Media {
+          command: ["prev", "toggle", "next"][index],
+          rewind: index == 1 && self.track.at_end,
+        });
       }
       if (SEEK_Y - 4..SEEK_Y + 8).contains(&relative_y)
         && self.track.duration > 0.0
@@ -1053,7 +1093,7 @@ impl Model {
       if x < PLAYER_X && (LIST_Y..TAB_END).contains(&y) {
         match self.music_tab {
           MusicTab::Playlists if !self.playlist_busy => {
-            let row = ((y - LIST_Y) / ROW_HEIGHT) as usize;
+            let row = ((y - LIST_Y) / PLAYLIST_ROW) as usize;
             if row < VISIBLE_ROWS {
               return self
                 .playlists
@@ -1156,6 +1196,16 @@ fn music_mic_hit(pointer: Option<(f64, f64)>) -> bool {
   inside(
     pointer,
     music_gain_x(MusicChannel::Send) - 12,
+    MUSIC_GAIN_TOP - 28,
+    24,
+    24,
+  )
+}
+
+fn music_headphones_hit(pointer: Option<(f64, f64)>) -> bool {
+  inside(
+    pointer,
+    music_gain_x(MusicChannel::Listen) - 12,
     MUSIC_GAIN_TOP - 28,
     24,
     24,
@@ -1485,13 +1535,9 @@ fn paint_timeline(cr: &Context, model: &Model) -> cairo::Result<()> {
 
 fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
   let track = &model.track;
-  for index in 0..4 {
+  for index in 0..3 {
     let x = TRANSPORT_X + index * BUTTON_WIDTH;
-    let enabled = match index {
-      3 => model.can_remove_song(),
-      _ => track.has_track,
-    };
-    if enabled
+    if track.has_track
       && inside(
         model.bar_pointer,
         x,
@@ -1501,7 +1547,7 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
       )
     {
       round(cr, x + 2, 6, BUTTON_WIDTH - 4, 28, 6.0);
-      color(cr, if index == 3 { 0xf38ba8 } else { 0xcba6f7 }, 0.20);
+      color(cr, 0xcba6f7, 0.20);
       cr.fill()?;
     }
   }
@@ -1523,7 +1569,20 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
     }
     cr.fill()?;
   }
-  let trash = f64::from(TRANSPORT_X + BUTTON_WIDTH * 3 + BUTTON_WIDTH / 2);
+  if model.can_remove_song()
+    && inside(
+      model.bar_pointer,
+      PLAYER_REMOVE_X,
+      PANEL_Y + TRANSPORT_Y,
+      TAB_WIDTH,
+      27,
+    )
+  {
+    round(cr, PLAYER_REMOVE_X, 5, TAB_WIDTH, 27, 6.0);
+    color(cr, 0xf38ba8, 0.20);
+    cr.fill()?;
+  }
+  let trash = f64::from(PLAYER_REMOVE_X + TAB_WIDTH / 2);
   color(
     cr,
     if model.can_remove_song() {
@@ -1588,6 +1647,48 @@ fn tab_symbol(cr: &Context, tab: MusicTab, x: i32, y: i32) -> cairo::Result<()> 
   cr.stroke()
 }
 
+fn paint_search_field(cr: &Context, model: &Model, left: i32, width: i32) -> cairo::Result<()> {
+  round(cr, left - 3, LIST_Y, width + 3, 30, 6.0);
+  color(cr, 0x313244, 1.0);
+  cr.fill()?;
+  color(cr, 0xcdd6f4, 1.0);
+  let query = if model.search_query.is_empty() {
+    "Search songs"
+  } else {
+    &model.search_query
+  };
+  let layout = text_layout(cr, query, 12, Weight::Normal);
+  let x = f64::from(left + 3);
+  let y = f64::from(LIST_Y + 6);
+  let field_width = f64::from(width - 33);
+  let (caret, _) = layout.cursor_pos(model.search_cursor as i32);
+  let caret_x = f64::from(caret.x()) / f64::from(SCALE);
+  let scroll = (caret_x - field_width + 2.0).max(0.0);
+  cr.save()?;
+  cr.rectangle(x, y, field_width, 20.0);
+  cr.clip();
+  color(
+    cr,
+    if model.search_query.is_empty() {
+      0xa6adc8
+    } else {
+      0xcdd6f4
+    },
+    1.0,
+  );
+  cr.move_to(x - scroll, y);
+  pangocairo::functions::show_layout(cr, &layout);
+  if model.search_cursor_visible {
+    color(cr, 0xcba6f7, 1.0);
+    cr.rectangle(x + caret_x - scroll, y + 1.0, 1.0, 15.0);
+    cr.fill()?;
+  }
+  cr.restore()?;
+  color(cr, 0xcdd6f4, 1.0);
+  tab_symbol(cr, MusicTab::Search, PLAYER_X - 20, LIST_Y + 15)?;
+  Ok(())
+}
+
 fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<()> {
   let width = PLAYER_X - left - 8;
   for (index, tab) in MUSIC_TABS.into_iter().enumerate() {
@@ -1603,18 +1704,6 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
     tab_symbol(cr, tab, x + TAB_WIDTH / 2, TAB_Y + 13)?;
   }
 
-  if !model.playlist_busy && inside(model.bar_pointer, TAB_SIGN_OUT_X, TAB_Y, TAB_WIDTH, 27) {
-    round(cr, TAB_SIGN_OUT_X + 2, TAB_Y, TAB_WIDTH - 4, 26, 6.0);
-    color(cr, 0xcba6f7, 0.25);
-    cr.fill()?;
-  }
-  color(cr, 0xa6adc8, if model.playlist_busy { 0.5 } else { 1.0 });
-  sign_out_symbol(
-    cr,
-    f64::from(TAB_SIGN_OUT_X + TAB_WIDTH / 2),
-    f64::from(TAB_Y + 13),
-  )?;
-
   match model.music_tab {
     MusicTab::Playlists => {
       if model.playlists.is_empty() && !model.playlist_busy {
@@ -1629,7 +1718,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
         );
       }
       for (row, list) in model.visible_playlists().enumerate() {
-        let y = LIST_Y + row as i32 * ROW_HEIGHT;
+        let y = LIST_Y + row as i32 * PLAYLIST_ROW;
         let selected = model.loading_playlist.as_ref().map_or_else(
           || {
             model
@@ -1639,9 +1728,9 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
           },
           |loading| loading == &list.id,
         );
-        let hovered = inside(model.bar_pointer, left - 4, y, width + 4, ROW_HEIGHT - 3);
+        let hovered = inside(model.bar_pointer, left - 4, y, width + 4, PLAYLIST_ROW - 3);
         if selected || hovered {
-          round(cr, left - 4, y, width + 4, ROW_HEIGHT - 3, 7.0);
+          round(cr, left - 4, y, width + 4, PLAYLIST_ROW - 3, 7.0);
           color(cr, 0xcba6f7, if hovered { 0.23 } else { 0.16 });
           cr.fill()?;
         }
@@ -1731,44 +1820,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
       cr.restore()?;
     }
     MusicTab::Search => {
-      round(cr, left - 3, LIST_Y, width + 3, 30, 6.0);
-      color(cr, 0x313244, 1.0);
-      cr.fill()?;
-      color(cr, 0xcdd6f4, 1.0);
-      let query = if model.search_query.is_empty() {
-        "Search songs"
-      } else {
-        &model.search_query
-      };
-      let layout = text_layout(cr, query, 12, Weight::Normal);
-      let x = f64::from(left + 3);
-      let y = f64::from(LIST_Y + 6);
-      let field_width = f64::from(width - 33);
-      let (caret, _) = layout.cursor_pos(model.search_cursor as i32);
-      let caret_x = f64::from(caret.x()) / f64::from(SCALE);
-      let scroll = (caret_x - field_width + 2.0).max(0.0);
-      cr.save()?;
-      cr.rectangle(x, y, field_width, 20.0);
-      cr.clip();
-      color(
-        cr,
-        if model.search_query.is_empty() {
-          0xa6adc8
-        } else {
-          0xcdd6f4
-        },
-        1.0,
-      );
-      cr.move_to(x - scroll, y);
-      pangocairo::functions::show_layout(cr, &layout);
-      if model.search_cursor_visible {
-        color(cr, 0xcba6f7, 1.0);
-        cr.rectangle(x + caret_x - scroll, y + 1.0, 1.0, 15.0);
-        cr.fill()?;
-      }
-      cr.restore()?;
-      color(cr, 0xcdd6f4, 1.0);
-      tab_symbol(cr, MusicTab::Search, PLAYER_X - 20, LIST_Y + 15)?;
+      paint_search_field(cr, model, left, width)?;
       if let Some(status) = &model.search_status {
         color(cr, 0xa6adc8, 1.0);
         label(
@@ -1858,22 +1910,29 @@ fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo
     MusicChannel::Send => Device::Input,
   };
   let send = channel == MusicChannel::Send;
-  if send && music_mic_hit(model.bar_pointer) {
+  let hovered = model.audio_hover[channel as usize].opacity();
+  let gain_muted = level.is_some_and(|(_, volume)| volume.muted);
+  let muted = gain_muted || (send && !model.mic_route);
+  if hovered > 0.0 {
     round(cr, x - 12, icon_y - 12, 24, 24, 6.0);
-    color(cr, 0xcba6f7, 0.20);
+    color(
+      cr,
+      if muted && !send { 0xf38ba8 } else { 0xcdd6f4 },
+      0.16 * hovered,
+    );
     cr.fill()?;
   }
-  color(
-    cr,
-    if send && model.mic_route {
-      0xa6e3a1
-    } else {
-      0xcdd6f4
-    },
-    1.0,
-  );
+  let icon_color = if send && !muted {
+    0xa6e3a1
+  } else if !send && muted {
+    0xf38ba8
+  } else {
+    0xcdd6f4
+  };
+  color(cr, icon_color, 0.82 + 0.18 * hovered);
   paint_audio_device(cr, f64::from(x), f64::from(icon_y), device)?;
-  if send && !model.mic_route {
+  if muted {
+    cr.set_line_width(1.5);
     cr.move_to(f64::from(x - 7), f64::from(icon_y + 7));
     cr.line_to(f64::from(x + 7), f64::from(icon_y - 7));
     cr.stroke()?;
@@ -1916,10 +1975,64 @@ fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo
   Ok(())
 }
 
+fn paint_music_confirmation(
+  cr: &Context,
+  model: &Model,
+  pending: &MusicConfirmation,
+) -> cairo::Result<()> {
+  let (left, top, width) = model.confirmation_geometry();
+  let (prompt, confirm) = match pending {
+    MusicConfirmation::Remove(removal) => (format!("Remove {}?", removal.title), "Remove"),
+    MusicConfirmation::SignOut => ("Sign out of YouTube Music?".into(), "Sign out"),
+  };
+  color(cr, 0xcdd6f4, 1.0);
+  label(
+    cr,
+    &prompt,
+    (left, top, width),
+    12,
+    Weight::Semibold,
+    Alignment::Center,
+  );
+  let half = width / 2 - 3;
+  let y = top + 21;
+  for (text, x, accent) in [
+    ("Cancel", left, 0x45475a),
+    (confirm, left + width - half, 0xf38ba8),
+  ] {
+    round(cr, x, y, half, 24, 6.0);
+    color(
+      cr,
+      accent,
+      if inside(model.bar_pointer, x, y, half, 24) {
+        0.75
+      } else {
+        0.40
+      },
+    );
+    cr.fill()?;
+    color(cr, 0xcdd6f4, 1.0);
+    label(
+      cr,
+      text,
+      (x, y + 4, half),
+      12,
+      Weight::Semibold,
+      Alignment::Center,
+    );
+  }
+  Ok(())
+}
+
 fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
   color(cr, 0xcdd6f4, 1.0);
   let left = PANEL_X + 12;
   if model.panel == Panel::Music {
+    if !model.signed_in
+      && let Some(pending) = &model.confirmation
+    {
+      return paint_music_confirmation(cr, model, pending);
+    }
     if !model.library_checked && model.playlist_error.is_none() {
       label(
         cr,
@@ -1946,7 +2059,9 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       color(cr, 0xcba6f7, 1.0);
       label(
         cr,
-        if !model.library_checked {
+        if model.signing_in {
+          "Signing in…"
+        } else if !model.library_checked {
           "Retry loading your library"
         } else if model.reconnect {
           "Reconnect to YouTube Music"
@@ -1958,12 +2073,11 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
         Weight::Semibold,
         Alignment::Center,
       );
-      let status = model.playlist_error.as_deref().or(
-        model
-          .signing_in
-          .then_some("Close the sign-in window to load your library."),
-      );
-      if let Some(status) = status {
+      if let Some(status) = model
+        .playlist_error
+        .as_deref()
+        .filter(|_| !model.signing_in)
+      {
         color(cr, 0xa6adc8, 1.0);
         label(
           cr,
@@ -2020,71 +2134,36 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
     color(cr, 0xa6adc8, 1.0);
     label(
       cr,
-      artist,
+      model.music_status().unwrap_or(artist),
       (PLAYER_X, PANEL_Y + 202, PLAYER_WIDTH - 5),
       12,
       Weight::Normal,
       Alignment::Center,
     );
+    for channel in MusicChannel::ALL {
+      paint_music_gain(cr, model, channel)?;
+    }
+    paint_music_library(cr, model, left)?;
+    if let Some(pending) = &model.confirmation {
+      return paint_music_confirmation(cr, model, pending);
+    }
     paint_timeline(cr, model)?;
     cr.save()?;
     cr.translate(0.0, f64::from(PANEL_Y + TRANSPORT_Y - 5));
     transport(cr, model)?;
     cr.restore()?;
-
-    if let Some(status) = model.music_status() {
-      color(cr, 0xa6adc8, 1.0);
-      label(
-        cr,
-        status,
-        (PLAYER_X, TRANSPORT_END + 4, PLAYER_WIDTH - 8),
-        11,
-        Weight::Normal,
-        Alignment::Center,
-      );
+    let y = PANEL_Y + TRANSPORT_Y;
+    if !model.playlist_busy && inside(model.bar_pointer, PLAYER_SIGN_OUT_X, y, TAB_WIDTH, 27) {
+      round(cr, PLAYER_SIGN_OUT_X, y, TAB_WIDTH, 27, 6.0);
+      color(cr, 0xcba6f7, 0.20);
+      cr.fill()?;
     }
-
-    for channel in MusicChannel::ALL {
-      paint_music_gain(cr, model, channel)?;
-    }
-    paint_music_library(cr, model, left)?;
-    if let Some(removal) = &model.removal {
-      let confirm_y = model.music_body_bottom() + 22;
-      color(cr, 0xcdd6f4, 1.0);
-      label(
-        cr,
-        &format!("Remove {}?", removal.title),
-        (left, confirm_y - 22, PANEL_WIDTH - 24),
-        13,
-        Weight::Semibold,
-        Alignment::Left,
-      );
-      for (text, x, width, accent) in [
-        ("Cancel", PANEL_X + PANEL_WIDTH - 163, 63, 0x313244),
-        ("Remove", PANEL_X + PANEL_WIDTH - 92, 80, 0xf38ba8),
-      ] {
-        round(cr, x, confirm_y, width, 24, 6.0);
-        color(
-          cr,
-          accent,
-          if inside(model.bar_pointer, x, confirm_y, width, 24) {
-            0.85
-          } else {
-            0.50
-          },
-        );
-        cr.fill()?;
-        color(cr, 0xcdd6f4, 1.0);
-        label(
-          cr,
-          text,
-          (x, confirm_y + 4, width),
-          12,
-          Weight::Semibold,
-          Alignment::Center,
-        );
-      }
-    }
+    color(cr, 0xa6adc8, if model.playlist_busy { 0.5 } else { 1.0 });
+    sign_out_symbol(
+      cr,
+      f64::from(PLAYER_SIGN_OUT_X + TAB_WIDTH / 2),
+      f64::from(y + 13),
+    )?;
     return Ok(());
   }
 
@@ -2475,7 +2554,48 @@ pub(crate) fn bar_outline(cr: &Context, height: i32) {
   cr.close_path();
 }
 
-fn paint_bar(cr: &Context, model: &Model) -> cairo::Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BarRegion {
+  Header,
+  Timeline,
+  Search,
+}
+
+impl BarRegion {
+  pub fn bounds(self) -> (i32, i32, i32, i32) {
+    let left = PANEL_X + 12;
+    match self {
+      Self::Header => (0, 0, WIDTH, HEIGHT),
+      Self::Timeline => (PLAYER_X + 6, PANEL_Y + SEEK_Y - 18, PLAYER_WIDTH - 14, 24),
+      Self::Search => (left - 3, LIST_Y, PLAYER_X - left - 5, 30),
+    }
+  }
+
+  pub fn paint(self, cr: &Context, model: &Model) -> cairo::Result<()> {
+    if self == Self::Header {
+      cr.set_operator(Operator::Clear);
+      cr.paint()?;
+      cr.set_operator(Operator::Over);
+      paint_bar_background(cr, model)?;
+      return paint_bar_header(cr, model);
+    }
+    // These regions are entirely inside the bar outline.
+    cr.set_operator(Operator::Source);
+    color(cr, 0x1e1e2e, model.opacity);
+    cr.paint()?;
+    cr.set_operator(Operator::Over);
+    match self {
+      Self::Timeline => paint_timeline(cr, model),
+      Self::Search => {
+        let left = PANEL_X + 12;
+        paint_search_field(cr, model, left, PLAYER_X - left - 8)
+      }
+      Self::Header => unreachable!(),
+    }
+  }
+}
+
+fn paint_bar_background(cr: &Context, model: &Model) -> cairo::Result<()> {
   let width = f64::from(WIDTH);
   bar_outline(cr, model.bar_height());
   let outline = cr.copy_path()?;
@@ -2502,6 +2622,10 @@ fn paint_bar(cr: &Context, model: &Model) -> cairo::Result<()> {
   cr.append_path(&outline);
   color(cr, 0x1e1e2e, model.opacity);
   cr.fill()?;
+  Ok(())
+}
+
+fn paint_bar_header(cr: &Context, model: &Model) -> cairo::Result<()> {
   for (left, hover) in BUTTONS.into_iter().zip(&model.hover) {
     let opacity = hover.opacity();
     if opacity > 0.0 {
@@ -2560,6 +2684,12 @@ fn paint_bar(cr: &Context, model: &Model) -> cairo::Result<()> {
   cr.line_to(music + 0.5, 13.0);
   cr.curve_to(music + 1.5, 15.0, music + 4.0, 15.0, music + 4.5, 18.0);
   cr.stroke()?;
+  Ok(())
+}
+
+fn paint_bar(cr: &Context, model: &Model) -> cairo::Result<()> {
+  paint_bar_background(cr, model)?;
+  paint_bar_header(cr, model)?;
   if model.panel != Panel::None {
     paint_panel(cr, model)?;
   }

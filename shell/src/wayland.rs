@@ -28,6 +28,25 @@ struct Buffer {
   handle: wl_buffer::WlBuffer,
   image: ImageSurface,
   busy: bool,
+  damage: Damage,
+}
+
+#[derive(Clone, Copy, Default)]
+enum Damage {
+  #[default]
+  Clean,
+  Region(ui::BarRegion),
+  Full,
+}
+
+impl Damage {
+  fn add(&mut self, region: ui::BarRegion) {
+    *self = match *self {
+      Self::Clean => Self::Region(region),
+      Self::Region(pending) if pending == region => *self,
+      _ => Self::Full,
+    };
+  }
 }
 
 impl Drop for Buffer {
@@ -46,6 +65,7 @@ struct Surface {
   configure: Option<(i32, i32)>,
   scale: i32,
   dirty: bool,
+  damage: Damage,
   painted: Option<ImageSurface>,
   motion: Option<BarMotion>,
   frame: Option<wl_callback::WlCallback>,
@@ -278,6 +298,7 @@ impl Desktop {
       configure: None,
       scale: 1,
       dirty: true,
+      damage: Damage::Clean,
       painted: None,
       motion: None,
       frame: None,
@@ -327,6 +348,12 @@ impl Desktop {
       popup.dirty = true;
     }
     self.draw_pending()
+  }
+
+  pub fn repaint_bar(&mut self, region: ui::BarRegion) {
+    if let Some(bar) = &mut self.bar {
+      bar.damage.add(region);
+    }
   }
 
   pub fn draw_pending(&mut self) -> Result<bool> {
@@ -445,9 +472,8 @@ impl Desktop {
       self.caret_tick = Some(now + CARET_PERIOD);
       let mut model = self.model.borrow_mut();
       model.search_cursor_visible = !model.search_cursor_visible;
-      if let Some(bar) = &mut self.bar {
-        bar.dirty = true;
-      }
+      drop(model);
+      self.repaint_bar(ui::BarRegion::Search);
     }
   }
 
@@ -493,22 +519,34 @@ impl Desktop {
         model.search_cursor += input.len();
       }
     }
-    if model.search_query.len() != previous_len {
+    let edited = model.search_query.len() != previous_len;
+    if edited {
       model.search_edited();
     }
     model.search_cursor_visible = true;
     self.caret_tick = Some(Instant::now() + CARET_PERIOD);
-    if let Some(bar) = &mut self.bar {
-      bar.dirty = true;
+    drop(model);
+    if edited {
+      if let Some(bar) = &mut self.bar {
+        bar.dirty = true;
+      }
+    } else {
+      self.repaint_bar(ui::BarRegion::Search);
     }
     true
   }
 
   pub fn animate_bar(&mut self) -> bool {
-    if let Some(bar) = &mut self.bar
-      && (bar.motion.is_some() || self.model.borrow().hover_animating())
-    {
+    let Some(bar) = &mut self.bar else {
+      return false;
+    };
+    let model = self.model.borrow();
+    if bar.motion.is_some() || model.panel_hover_animating() {
       bar.dirty = true;
+      return true;
+    }
+    if model.header_hover_animating() {
+      bar.damage.add(ui::BarRegion::Header);
       return true;
     }
     false
@@ -525,7 +563,9 @@ impl Desktop {
     let Some((width, height)) = surface.configure else {
       return Ok(());
     };
-    if !surface.dirty || surface.requested != (width, height) {
+    if (!surface.dirty && matches!(surface.damage, Damage::Clean))
+      || surface.requested != (width, height)
+    {
       return Ok(());
     }
     let scale = surface.scale;
@@ -533,6 +573,18 @@ impl Desktop {
     surface
       .backing
       .retain(|b| b.image.width() == pixel_w && b.image.height() == pixel_h);
+    // A released buffer can be several frames behind the one on screen.
+    for buffer in &mut surface.backing {
+      if surface.dirty || surface.motion.is_some() {
+        buffer.damage = Damage::Full;
+      } else {
+        match surface.damage {
+          Damage::Region(region) => buffer.damage.add(region),
+          Damage::Full => buffer.damage = Damage::Full,
+          Damage::Clean => {}
+        }
+      }
+    }
     let free = surface.backing.iter().position(|buffer| !buffer.busy);
     let index = match free {
       Some(index) => index,
@@ -560,6 +612,7 @@ impl Desktop {
           handle,
           image,
           busy: false,
+          damage: Damage::Full,
         });
         surface.backing.len() - 1
       }
@@ -568,6 +621,24 @@ impl Desktop {
     let buffer = &mut surface.backing[index];
     let cr = Context::new(&buffer.image)?;
     cr.scale(f64::from(scale), f64::from(scale));
+    if let Damage::Region(region) = buffer.damage {
+      let (x, y, w, h) = region.bounds();
+      cr.rectangle(f64::from(x), f64::from(y), f64::from(w), f64::from(h));
+      cr.clip();
+      region.paint(&cr, model)?;
+      drop(cr);
+      buffer.image.flush();
+      surface.surface.attach(Some(&buffer.handle), 0, 0);
+      surface
+        .surface
+        .damage_buffer(x * scale, y * scale, w * scale, h * scale);
+      surface.surface.commit();
+      buffer.busy = true;
+      buffer.damage = Damage::Clean;
+      surface.damage = Damage::Clean;
+      surface.painted = Some(buffer.image.clone());
+      return Ok(());
+    }
     let content_height = if kind == Layer::Bar {
       bar_content_height(height)
     } else {
@@ -675,6 +746,8 @@ impl Desktop {
     surface.surface.commit();
     buffer.busy = true;
     surface.dirty = false;
+    surface.damage = Damage::Clean;
+    buffer.damage = Damage::Clean;
     Ok(())
   }
 
@@ -926,7 +999,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Desktop {
       Event::Leave { surface, .. } if surface.data::<Layer>() == Some(&Layer::Bar) => {
         state.bar_keyboard_focus = false;
         state.repeated_key = None;
-        state.actions.push(Action::DismissBar);
+        state.actions.push(Action::BarFocusLost);
       }
       Event::RepeatInfo { rate, delay } => {
         state.keyboard_repeat = (rate > 0).then(|| {
