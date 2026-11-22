@@ -7,7 +7,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-const MIX: &str = "desktop_shell_mix_sink";
+pub const MUSIC_SINK: &str = "desktop_shell_music_sink";
+const SEND_CAPTURE: &str = "desktop_shell_music_send_capture";
+
+pub fn music_mix_enabled() -> bool {
+  std::env::var_os("LINTEL_MUSIC_MIX").is_some_and(|value| value == "1")
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Device {
@@ -31,6 +36,23 @@ pub struct Volume {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MusicChannel {
+  Listen,
+  Send,
+}
+
+impl MusicChannel {
+  pub const ALL: [Self; 2] = [Self::Listen, Self::Send];
+
+  fn node(self) -> &'static str {
+    match self {
+      Self::Listen => "desktop_shell_music_listen",
+      Self::Send => "desktop_shell_music_send",
+    }
+  }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StreamId {
   index: u32,
   pub recording: bool,
@@ -46,7 +68,12 @@ pub struct Stream {
   pub music: bool,
 }
 
-pub fn streams(player: u32, music_only: bool) -> Vec<Stream> {
+pub fn streams(player: u32, music_only: bool, split_music: bool) -> Vec<Stream> {
+  let music_inputs = if split_music {
+    music_stream_ids().unwrap_or_default()
+  } else {
+    Vec::new()
+  };
   let mut streams: Vec<Stream> = Vec::new();
   for (kind, recording) in [("sink-inputs", false), ("source-outputs", true)] {
     if music_only && (recording || player == 0) {
@@ -65,11 +92,12 @@ pub fn streams(player: u32, music_only: bool) -> Vec<Stream> {
       let index = u32::try_from(item["index"].as_u64()?).ok()?;
       let properties = &item["properties"];
       let music = !recording
-        && player != 0
-        && properties["application.process.id"]
-          .as_str()
-          .and_then(|pid| pid.parse().ok())
-          == Some(player);
+        && (music_inputs.contains(&u64::from(index))
+          || (player != 0
+            && properties["application.process.id"]
+              .as_str()
+              .and_then(|pid| pid.parse().ok())
+              == Some(player)));
       if music_only && !music {
         return None;
       }
@@ -155,8 +183,12 @@ pub fn set_stream(id: StreamId, value: Option<u8>, muted: bool) -> io::Result<()
 }
 
 pub fn get(device: Device) -> io::Result<Volume> {
+  get_target(device.target())
+}
+
+fn get_target(target: &str) -> io::Result<Volume> {
   let output = Command::new("wpctl")
-    .args(["get-volume", device.target()])
+    .args(["get-volume", target])
     .output()?;
   let line = String::from_utf8_lossy(&output.stdout);
   let percent = line
@@ -172,16 +204,48 @@ pub fn get(device: Device) -> io::Result<Volume> {
 }
 
 pub fn set(device: Device, value: Option<u8>) -> io::Result<Volume> {
+  set_target(device.target(), value)
+}
+
+fn set_target(target: &str, value: Option<u8>) -> io::Result<Volume> {
   let mut command = Command::new("wpctl");
   if let Some(value) = value {
-    command.args(["set-volume", device.target(), &format!("{value}%")]);
+    command.args(["set-volume", target, &format!("{value}%")]);
   } else {
-    command.args(["set-mute", device.target(), "toggle"]);
+    command.args(["set-mute", target, "toggle"]);
   }
   if !command.status()?.success() {
     return Err(io::Error::other("Could not set audio volume"));
   }
-  get(device)
+  get_target(target)
+}
+
+pub fn set_music(node: u64, value: Option<u8>) -> io::Result<Volume> {
+  set_target(&node.to_string(), value)
+}
+
+pub fn music_levels() -> [Option<(u64, Volume)>; 2] {
+  let Ok(objects) = graph() else {
+    return [None; 2];
+  };
+  MusicChannel::ALL.map(|channel| {
+    let object = find_node(&objects, channel.node())?;
+    let node = id(object)?;
+    let props = &object["info"]["params"]["Props"][0];
+    let gain = props["channelVolumes"]
+      .as_array()?
+      .iter()
+      .filter_map(Value::as_f64)
+      .reduce(f64::max)?;
+    Some((
+      node,
+      Volume {
+        // WirePlumber's displayed gain is cubic.
+        percent: (gain.cbrt() * 100.0).round() as u8,
+        muted: props["mute"].as_bool().unwrap_or(false),
+      },
+    ))
+  })
 }
 
 pub fn step_output(step: i32) -> io::Result<Volume> {
@@ -203,11 +267,7 @@ pub fn step_output(step: i32) -> io::Result<Volume> {
 }
 
 pub enum Route {
-  Update {
-    enabled: bool,
-    player: u32,
-    revision: u64,
-  },
+  Update { enabled: bool, revision: u64 },
   Stop,
 }
 
@@ -239,7 +299,6 @@ pub fn route_worker() -> (
         Ok(Route::Update {
           enabled: false,
           revision,
-          ..
         }) => {
           retry = 0;
           active = None;
@@ -252,16 +311,15 @@ pub fn route_worker() -> (
         }
         Ok(Route::Update {
           enabled: true,
-          player,
           revision,
         }) => {
-          active = Some((player, revision));
+          active = Some(revision);
           retry = 12;
         }
         Err(RecvTimeoutError::Timeout) => {}
       }
-      if let Some((player, revision)) = active {
-        match sync_links(player, &mut links) {
+      if let Some(revision) = active {
+        match sync_links(&mut links) {
           Ok(ready) => {
             if retry == 12 {
               let _ = report.try_send(RouteStatus {
@@ -303,6 +361,31 @@ fn props(object: &Value) -> &Value {
 
 fn id(object: &Value) -> Option<u64> {
   object["id"].as_u64()
+}
+
+fn find_node<'a>(objects: &'a [Value], name: &str) -> Option<&'a Value> {
+  objects.iter().find(|object| {
+    object["type"] == "PipeWire:Interface:Node" && props(object)["node.name"] == name
+  })
+}
+
+fn music_stream_ids() -> Option<Vec<u64>> {
+  let objects = graph().ok()?;
+  let sink = id(find_node(&objects, MUSIC_SINK)?)?;
+  Some(
+    objects
+      .iter()
+      .filter_map(|object| {
+        let from = object["info"]["output-node-id"].as_u64()?;
+        if object["info"]["input-node-id"].as_u64()? != sink {
+          return None;
+        }
+        // PipeWire-Pulse exposes the stream's serial as its sink-input index.
+        let stream = objects.iter().find(|node| id(node) == Some(from))?;
+        props(stream)["object.serial"].as_u64()
+      })
+      .collect(),
+  )
 }
 
 struct MusicLink {
@@ -349,25 +432,14 @@ impl Drop for MusicLink {
   }
 }
 
-fn sync_links(player: u32, links: &mut Vec<MusicLink>) -> io::Result<bool> {
+fn sync_links(links: &mut Vec<MusicLink>) -> io::Result<bool> {
   let objects = graph()?;
-  let sink = objects
-    .iter()
-    .find(|object| object["type"] == "PipeWire:Interface:Node" && props(object)["node.name"] == MIX)
+  let sink = find_node(&objects, SEND_CAPTURE)
     .and_then(id)
     .ok_or_else(|| io::Error::other("Music microphone is unavailable"))?;
-  let Some(source) = objects
-    .iter()
-    .find(|object| {
-      object["type"] == "PipeWire:Interface:Node"
-        && props(object)["media.class"] == "Stream/Output/Audio"
-        && props(object)["application.process.id"].as_u64() == Some(u64::from(player))
-    })
+  let source = find_node(&objects, MUSIC_SINK)
     .and_then(id)
-  else {
-    links.clear();
-    return Ok(false);
-  };
+    .ok_or_else(|| io::Error::other("Music output is unavailable"))?;
   let port = |node, direction: &str, channel: &str| {
     objects
       .iter()
@@ -376,6 +448,7 @@ fn sync_links(player: u32, links: &mut Vec<MusicLink>) -> io::Result<bool> {
           && props(object)["node.id"].as_u64() == Some(node)
           && props(object)["port.direction"] == direction
           && props(object)["audio.channel"] == channel
+          && (direction != "out" || props(object)["port.monitor"].as_bool() == Some(true))
       })
       .and_then(id)
   };

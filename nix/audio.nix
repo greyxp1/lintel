@@ -24,7 +24,37 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
+    systemd.user.services.lintel.environment.LINTEL_MUSIC_MIX = "1";
+    services.pipewire.alsa.enable = true;
     services.pipewire.extraConfig.pipewire."92-desktop-shell-music-mic"."context.modules" = [
+      (loopback {
+        "audio.position" = stereo;
+        "capture.props" = {
+          "node.name" = "desktop_shell_music_sink";
+          "media.class" = "Audio/Sink/Internal";
+          "node.virtual" = true;
+          "priority.session" = 0;
+        };
+        "playback.props" = {
+          "node.name" = "desktop_shell_music_listen";
+          "node.passive" = true;
+        };
+      })
+      (loopback {
+        "audio.position" = stereo;
+        "capture.props" = {
+          "node.name" = "desktop_shell_music_send_capture";
+          "node.autoconnect" = false;
+          "node.passive" = true;
+        };
+        "playback.props" = {
+          "node.name" = "desktop_shell_music_send";
+          "target.object" = "desktop_shell_mix_sink";
+          "node.dont-fallback" = true;
+          "node.linger" = true;
+          "node.passive" = true;
+        };
+      })
       (loopback {
         "audio.position" = stereo;
         "capture.props" = {

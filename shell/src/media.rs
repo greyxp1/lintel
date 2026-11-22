@@ -299,7 +299,15 @@ pub fn seek(seconds: f64) {
 }
 
 fn run_control(args: &[&str]) -> bool {
-  match Command::new("ytm").args(args).status() {
+  let mut command = Command::new("ytm");
+  if crate::audio::music_mix_enabled() {
+    // The Pulse server only starts playback on public sinks. MyGo's ALSA
+    // backend can address the private sink through PipeWire's default PCM.
+    command
+      .env("PULSE_SERVER", "unix:/dev/null")
+      .env("PIPEWIRE_NODE", crate::audio::MUSIC_SINK);
+  }
+  match command.args(args).status() {
     Ok(status) => status.success(),
     Err(error) => {
       eprintln!("Music control: {error}");

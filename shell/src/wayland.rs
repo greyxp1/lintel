@@ -1060,7 +1060,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Desktop {
           let mut changed = model.hover_bar(Some(state.xy));
           changed |= model.drag_music(surface_x as i32, surface_y as i32);
           if let Some((slider, value)) = &mut model.slider_preview {
-            let next = slider.position(surface_x as i32);
+            let next = slider.position(surface_x as i32, surface_y as i32);
             if *value != next {
               changed = true;
               *value = next;

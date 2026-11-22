@@ -7,7 +7,7 @@ use cairo::{Context, Format, ImageSurface, Operator};
 use gio::glib::DateTime;
 use pango::{Alignment, EllipsizeMode, FontDescription, SCALE, Weight};
 
-use crate::audio::{Device, Stream, StreamId, Volume};
+use crate::audio::{Device, MusicChannel, Stream, StreamId, Volume};
 use crate::media::{Art, Bookmark, Playlist, QueueSong, Song, Track};
 
 pub const WIDTH: i32 = 408;
@@ -39,6 +39,8 @@ pub const PANEL_WIDTH: i32 = WIDTH - 2 * WING;
 const PANEL_X: i32 = (WIDTH - PANEL_WIDTH) / 2;
 const PANEL_Y: i32 = HEIGHT;
 const COVER: i32 = 160;
+const MUSIC_GAIN_TOP: i32 = PANEL_Y + 39;
+const MUSIC_GAIN_BOTTOM: i32 = PANEL_Y + COVER - 10;
 const ROW_HEIGHT: i32 = 40;
 const VISIBLE_ROWS: usize = 6;
 pub const POPUP_WIDTH: i32 = 340;
@@ -233,6 +235,7 @@ pub enum Slider {
   Device(Device),
   Stream(StreamId),
   Music(StreamId),
+  MusicLevel(MusicChannel, u64),
 }
 
 impl Slider {
@@ -240,11 +243,15 @@ impl Slider {
     match self {
       Self::Device(_) => AUDIO_NAME_X,
       Self::Stream(_) => SLIDER_X,
-      Self::Music(_) => PLAYER_X + 32,
+      Self::Music(_) | Self::MusicLevel(..) => unreachable!("vertical music slider"),
     }
   }
 
-  pub fn position(self, x: i32) -> u8 {
+  pub fn position(self, x: i32, y: i32) -> u8 {
+    if matches!(self, Self::Music(_) | Self::MusicLevel(..)) {
+      return ((MUSIC_GAIN_BOTTOM - y) * 100 / (MUSIC_GAIN_BOTTOM - MUSIC_GAIN_TOP)).clamp(0, 100)
+        as u8;
+    }
     ((x - self.start()) * 100 / (SLIDER_END - self.start())).clamp(0, 100) as u8
   }
 
@@ -252,7 +259,7 @@ impl Slider {
     if mute {
       Some(Action::Volume(self, None))
     } else {
-      (x >= self.start()).then(|| Action::Volume(self, Some(self.position(x))))
+      (x >= self.start()).then(|| Action::Volume(self, Some(self.position(x, 0))))
     }
   }
 }
@@ -358,6 +365,8 @@ pub struct Model {
   icons: HashMap<String, Option<ImageSurface>>,
   pub slider_preview: Option<(Slider, u8)>,
   pub audio_watching: bool,
+  pub music_mix: bool,
+  pub music_levels: [Option<(u64, Volume)>; 2],
   pub audio_requests: VecDeque<AudioChange>,
   pub volume_feedback: Option<(Instant, Volume)>,
   popup_pointer: Option<(f64, f64)>,
@@ -447,6 +456,18 @@ impl Model {
 
   fn music_stream(&self) -> Option<&Stream> {
     self.streams.iter().find(|stream| stream.music)
+  }
+
+  fn music_slider(&self, channel: MusicChannel) -> Option<(Slider, Volume)> {
+    if self.music_mix {
+      let (id, volume) = self.music_levels[channel as usize]?;
+      Some((Slider::MusicLevel(channel, id), volume))
+    } else if channel == MusicChannel::Listen {
+      let stream = self.music_stream()?;
+      Some((Slider::Music(stream.id), stream.volume))
+    } else {
+      None
+    }
   }
 
   fn app_streams(&self) -> impl Iterator<Item = &Stream> {
@@ -575,6 +596,10 @@ impl Model {
     let volume = match target {
       Slider::Device(Device::Output) => self.output.as_mut(),
       Slider::Device(Device::Input) => self.input.as_mut(),
+      Slider::MusicLevel(channel, id) => self.music_levels[channel as usize]
+        .as_mut()
+        .filter(|(node, _)| *node == id)
+        .map(|(_, volume)| volume),
       Slider::Stream(id) | Slider::Music(id) => self
         .streams
         .iter_mut()
@@ -645,6 +670,7 @@ impl Model {
       .playlist_error
       .as_deref()
       .or(self.mic_error.as_deref())
+      .or(self.audio_error.as_deref())
       .or(self.playlist_busy.then_some("Loading…"))
   }
 
@@ -656,12 +682,7 @@ impl Model {
       MusicTab::Lyrics => TAB_END,
       MusicTab::Search => RESULTS_Y + rows * RESULTS_ROW,
     };
-    let player_end = self.music_volume_y() + if self.music_stream().is_some() { 18 } else { 0 };
-    player_end.max(list_end) + 8
-  }
-
-  fn music_volume_y(&self) -> i32 {
-    TRANSPORT_END + if self.music_status().is_some() { 19 } else { 0 }
+    (TRANSPORT_END + if self.music_status().is_some() { 19 } else { 0 }).max(list_end) + 8
   }
 
   pub fn visible_playlists(&self) -> impl Iterator<Item = &Playlist> {
@@ -930,13 +951,17 @@ impl Model {
       };
     }
     if self.panel == Panel::Music {
-      let volume_y = self.music_volume_y();
-      if self.signed_in
-        && (PLAYER_X + 8..PANEL_X + PANEL_WIDTH - 8).contains(&x)
-        && (volume_y..volume_y + 22).contains(&y)
-        && let Some(stream) = self.music_stream()
-      {
-        return Slider::Music(stream.id).pick(x, right);
+      if self.signed_in && (MUSIC_GAIN_TOP - 8..=MUSIC_GAIN_BOTTOM + 8).contains(&y) {
+        for channel in MusicChannel::ALL {
+          if (x - music_gain_x(channel)).abs() <= 12
+            && let Some((slider, _)) = self.music_slider(channel)
+          {
+            return Some(Action::Volume(
+              slider,
+              (!right).then(|| slider.position(x, y)),
+            ));
+          }
+        }
       }
       if right || !(PANEL_X..PANEL_X + PANEL_WIDTH).contains(&x) {
         return None;
@@ -1115,6 +1140,14 @@ const SLIDER_END: i32 = PANEL_X + PANEL_WIDTH - 48;
 
 fn audio_slider_y(index: usize) -> i32 {
   PANEL_Y + 43 + index as i32 * 35
+}
+
+fn music_gain_x(channel: MusicChannel) -> i32 {
+  let margin = (PLAYER_WIDTH - COVER) / 4;
+  match channel {
+    MusicChannel::Listen => PLAYER_X + margin,
+    MusicChannel::Send => PLAYER_X + PLAYER_WIDTH - margin,
+  }
 }
 
 fn audio_button_hit(pointer: Option<(f64, f64)>, index: usize) -> bool {
@@ -1814,6 +1847,52 @@ fn paint_audio_device(cr: &Context, x: f64, y: f64, device: Device) -> cairo::Re
   }
 }
 
+fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo::Result<()> {
+  let Some((slider, volume)) = model.music_slider(channel) else {
+    return Ok(());
+  };
+  let volume = model.volume(slider, Some(volume)).unwrap_or(volume);
+  let x = music_gain_x(channel);
+  let height = MUSIC_GAIN_BOTTOM - MUSIC_GAIN_TOP;
+  let device = match channel {
+    MusicChannel::Listen => Device::Output,
+    MusicChannel::Send => Device::Input,
+  };
+  color(cr, 0xcdd6f4, 1.0);
+  paint_audio_device(cr, f64::from(x), f64::from(MUSIC_GAIN_TOP - 16), device)?;
+  color(cr, 0x45475a, 1.0);
+  round(cr, x - 3, MUSIC_GAIN_TOP, 6, height, 3.0);
+  cr.fill()?;
+  let filled = height * i32::from(volume.percent.min(100)) / 100;
+  if filled > 0 {
+    color(cr, if volume.muted { 0x6c7086 } else { 0xcba6f7 }, 1.0);
+    round(
+      cr,
+      x - 3,
+      MUSIC_GAIN_BOTTOM - filled,
+      6,
+      filled,
+      3.0_f64.min(f64::from(filled) / 2.0),
+    );
+    cr.fill()?;
+  }
+  color(cr, 0xcdd6f4, 1.0);
+  let value = if volume.muted {
+    "Muted".into()
+  } else {
+    format!("{}%", volume.percent)
+  };
+  label(
+    cr,
+    &value,
+    (x, MUSIC_GAIN_BOTTOM + 6, 0),
+    10,
+    Weight::Normal,
+    Alignment::Center,
+  );
+  Ok(())
+}
+
 fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
   color(cr, 0xcdd6f4, 1.0);
   let left = PANEL_X + 12;
@@ -1942,17 +2021,8 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       );
     }
 
-    if let Some(stream) = model.music_stream() {
-      let y = model.music_volume_y() + 7;
-      color(cr, 0xcdd6f4, 1.0);
-      paint_speaker(cr, f64::from(PLAYER_X + 18), f64::from(y + 4))?;
-      let slider = Slider::Music(stream.id);
-      draw_volume(
-        cr,
-        y,
-        slider,
-        model.volume(slider, Some(stream.volume)).as_ref(),
-      )?;
+    for channel in MusicChannel::ALL {
+      paint_music_gain(cr, model, channel)?;
     }
     paint_music_library(cr, model, left)?;
     if let Some(removal) = &model.removal {
