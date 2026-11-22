@@ -473,23 +473,8 @@ impl AudioHelper {
     command.spawn().map(Self)
   }
 
-  pub fn monitor_source() -> io::Result<Option<String>> {
-    if music_mix_enabled() {
-      let objects = graph()?;
-      let source = find_node(&objects, "desktop_shell_voice_capture")
-        .and_then(|node| props(node)["target.object"].as_str())
-        .ok_or_else(|| io::Error::other("Voice source unavailable"))?;
-      Ok(Some(source.into()))
-    } else {
-      Ok(None)
-    }
-  }
-
-  pub fn monitoring(source: Option<&str>) -> io::Result<Self> {
+  pub fn monitoring() -> io::Result<Self> {
     let mut command = Command::new("pw-loopback");
-    if let Some(source) = source {
-      command.args(["--capture", source]);
-    }
     command.args([
       "--name",
       "lintel-mic-monitor",

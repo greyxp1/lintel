@@ -203,7 +203,6 @@ fn run() -> Result<()> {
   let redraw = refresh.clone();
   let actions_router = router.clone();
   let monitor = Rc::new(RefCell::new(None::<audio::AudioHelper>));
-  let monitor_starting = Rc::new(Cell::new(false));
   glib::unix_fd_add_local(
     fd,
     IOCondition::IN | IOCondition::HUP | IOCondition::ERR,
@@ -326,55 +325,42 @@ fn run() -> Result<()> {
           }
           Action::OpenAudio => watch_audio(&model, &redraw),
           Action::ToggleMonitor => {
-            if monitor_starting.get() {
-              continue;
-            }
             if monitor.borrow_mut().take().is_some() {
               model.borrow_mut().monitoring = false;
-              redraw();
-              continue;
-            }
-            monitor_starting.set(true);
-            let starting = monitor_starting.clone();
-            let monitor = monitor.clone();
-            let model = model.clone();
-            let redraw = redraw.clone();
-            background(audio::AudioHelper::monitor_source, move |result| {
-              starting.set(false);
-              match result.and_then(|source| audio::AudioHelper::monitoring(source.as_deref())) {
+            } else {
+              match audio::AudioHelper::monitoring() {
                 Ok(helper) => {
                   let pid = helper.pid();
                   monitor.replace(Some(helper));
-                  model.borrow_mut().monitoring = true;
-                  glib::timeout_add_local(Duration::from_millis(500), {
-                    let monitor = monitor.clone();
-                    let model = model.clone();
-                    let redraw = redraw.clone();
-                    move || {
-                      let mut helper = monitor.borrow_mut();
-                      let Some(process) = helper.as_mut() else {
-                        return ControlFlow::Break;
-                      };
-                      if process.pid() != pid {
-                        return ControlFlow::Break;
-                      }
-                      if !process.exited() {
-                        return ControlFlow::Continue;
-                      }
-                      helper.take();
-                      let mut state = model.borrow_mut();
-                      state.monitoring = false;
-                      state.audio_error = Some("Mic monitoring stopped".into());
-                      drop(state);
-                      redraw();
-                      ControlFlow::Break
+                  let mut state = model.borrow_mut();
+                  state.monitoring = true;
+                  state.audio_error = None;
+                  drop(state);
+                  let monitor = monitor.clone();
+                  let model = model.clone();
+                  let redraw = redraw.clone();
+                  glib::timeout_add_local(Duration::from_millis(500), move || {
+                    let mut helper = monitor.borrow_mut();
+                    let Some(process) = helper.as_mut().filter(|process| process.pid() == pid)
+                    else {
+                      return ControlFlow::Break;
+                    };
+                    if !process.exited() {
+                      return ControlFlow::Continue;
                     }
+                    helper.take();
+                    let mut state = model.borrow_mut();
+                    state.monitoring = false;
+                    state.audio_error = Some("Mic monitoring stopped".into());
+                    drop(state);
+                    redraw();
+                    ControlFlow::Break
                   });
                 }
                 Err(error) => model.borrow_mut().audio_error = Some(error.to_string()),
               }
-              redraw();
-            });
+            }
+            redraw();
           }
           Action::SmallCovers => fetch_small_covers(&model, &redraw),
           Action::Volume(target, value) => {
