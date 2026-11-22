@@ -5,7 +5,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gio::glib::{self, Variant, variant::ToVariant};
+use gio::glib::variant::ToVariant;
+use gio::glib::{self, Variant};
+use gio::prelude::AppInfoExt;
 use gio::{Cancellable, DBusCallFlags, DBusConnection, DBusNodeInfo, DBusSignalFlags};
 
 use crate::media::Art;
@@ -697,21 +699,43 @@ impl Services {
             model.trays.remove(index);
           }
         } else {
+          let attention = property("Status").as_deref() == Some("NeedsAttention");
+          let icon_name = property("IconName");
           let title = property("Title")
-            .filter(|title| !title.is_empty())
-            .or_else(|| property("Id"))
-            .unwrap_or_else(|| address.name.clone());
-          let pixmaps = if property("Status").as_deref() == Some("NeedsAttention") {
-            props
-              .get("AttentionIconPixmap")
-              .or_else(|| props.get("IconPixmap"))
-          } else {
-            props.get("IconPixmap")
-          };
+            .filter(|title| descriptive_tray_title(title))
+            .or_else(|| {
+              let tooltip = props.get("ToolTip")?;
+              (tooltip.n_children() == 4)
+                .then(|| tooltip.child_value(2).get::<String>())
+                .flatten()
+                .filter(|title| descriptive_tray_title(title))
+            })
+            .or_else(|| {
+              [property("DesktopEntry"), property("Id"), icon_name.clone()]
+                .into_iter()
+                .flatten()
+                .find_map(|id| {
+                  let id = id.trim_end_matches(".desktop");
+                  gio::DesktopAppInfo::new(&format!("{id}.desktop"))
+                    .map(|app| app.display_name().to_string())
+                })
+            })
+            .or_else(|| property("Id").filter(|id| descriptive_tray_title(id)))
+            .unwrap_or_else(|| "Tray item".into());
+          let pixmaps = attention
+            .then(|| {
+              props
+                .get("AttentionIconPixmap")
+                .and_then(tray_icon)
+                .or_else(|| property("AttentionIconName").as_deref().and_then(app_icon))
+            })
+            .flatten()
+            .or_else(|| props.get("IconPixmap").and_then(tray_icon))
+            .or_else(|| icon_name.as_deref().and_then(app_icon));
           let item = TrayItem {
             address,
             title: title.chars().take(150).collect(),
-            image: pixmaps.and_then(tray_icon),
+            image: pixmaps,
             menu_only: props
               .get("ItemIsMenu")
               .and_then(Variant::get::<bool>)
@@ -747,6 +771,15 @@ impl Services {
 
 fn item_id(address: &Address) -> String {
   format!("{}{}", address.name, address.path)
+}
+
+fn descriptive_tray_title(title: &str) -> bool {
+  let title = title.trim();
+  !title.is_empty()
+    && !title.starts_with(':')
+    && !["main-tray", "main_tray", "tray"]
+      .iter()
+      .any(|generic| title.eq_ignore_ascii_case(generic))
 }
 
 fn tray_icon(pixmaps: &Variant) -> Option<cairo::ImageSurface> {
