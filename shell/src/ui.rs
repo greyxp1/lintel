@@ -181,6 +181,11 @@ pub struct Removal {
   title: String,
 }
 
+pub enum SignInStage {
+  Browser,
+  Library,
+}
+
 enum MusicConfirmation {
   Remove(Removal),
   SignOut,
@@ -362,7 +367,7 @@ pub struct Model {
   pub signed_in: bool,
   pub library_checked: bool,
   pub reconnect: bool,
-  pub signing_in: bool,
+  pub signing_in: Option<SignInStage>,
   pub(crate) bar_visible: bool,
   pub(crate) pointer_generation: u64,
   pub opacity: f64,
@@ -700,7 +705,10 @@ impl Model {
         SIGN_IN_Y
           + SIGN_IN_BUTTON_HEIGHT
           + 12
-          + if self.playlist_error.is_some() && !self.signing_in && self.confirmation.is_none() {
+          + if self.playlist_error.is_some()
+            && self.signing_in.is_none()
+            && self.confirmation.is_none()
+          {
             22
           } else {
             0
@@ -2112,7 +2120,9 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       color(cr, 0xcba6f7, 1.0);
       label(
         cr,
-        if model.signing_in {
+        if matches!(model.signing_in, Some(SignInStage::Library)) {
+          "Loading your library…"
+        } else if model.signing_in.is_some() {
           "Close the browser after signing in"
         } else if !model.library_checked {
           "Retry loading your library"
@@ -2129,7 +2139,7 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       if let Some(status) = model
         .playlist_error
         .as_deref()
-        .filter(|_| !model.signing_in)
+        .filter(|_| model.signing_in.is_none())
       {
         color(cr, 0xa6adc8, 1.0);
         label(

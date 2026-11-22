@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -625,10 +625,19 @@ pub fn session_command(command: &str) -> MediaResult<()> {
   Ok(())
 }
 
-pub fn sign_in() -> MediaResult<Library> {
-  let output = Command::new("lintel-ytmusic")
+pub fn sign_in(window_closed: impl FnOnce()) -> MediaResult<Library> {
+  let mut child = Command::new("lintel-ytmusic")
     .args(["login", "--library"])
-    .output()?;
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+  let mut first = [0];
+  let read = child.stdout.as_mut().unwrap().read(&mut first);
+  // An empty line identifies the point where the visible window closed.
+  if matches!(read, Ok(1)) && first[0] == b'\n' {
+    window_closed();
+  }
+  let mut output = child.wait_with_output()?;
   if !output.status.success() {
     return Err(
       String::from_utf8_lossy(&output.stderr)
@@ -636,6 +645,9 @@ pub fn sign_in() -> MediaResult<Library> {
         .to_owned()
         .into(),
     );
+  }
+  if read? == 1 && first[0] != b'\n' {
+    output.stdout.insert(0, first[0]);
   }
   Ok(Library::Connected(serde_json::from_slice(&output.stdout)?))
 }

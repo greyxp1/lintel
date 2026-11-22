@@ -72,7 +72,7 @@ class Browser:
                 return response.get("result", {})
 
 
-def browser_session(browser):
+def browser_session(browser, on_closed):
     with tempfile.TemporaryDirectory(prefix="lintel-login-", dir=os.environ.get("XDG_RUNTIME_DIR")) as profile:
         environment = {
             **os.environ, "XDG_CONFIG_HOME": profile, "XDG_CACHE_HOME": profile,
@@ -93,6 +93,7 @@ def browser_session(browser):
             raise SignInError("YouTube Music sign-in timed out.") from error
         if result.returncode:
             raise SignInError("The sign-in browser closed unexpectedly.")
+        on_closed()
         return read_browser_session(command, environment)
 
 
@@ -107,7 +108,9 @@ def read_browser_session(command, environment):
         process = subprocess.Popen(
             [
                 "sh", "-c", f'exec {redirections}; exec "$@"', "lintel-login",
-                *command, "--headless", "--remote-debugging-pipe", ORIGIN + "/",
+                # Use Chromium's normal browser mode with an offscreen platform.
+                *command, "--ozone-platform=headless", "--disable-gpu",
+                "--restore-last-session", "--remote-debugging-pipe", ORIGIN + "/",
             ],
             env=environment, pass_fds=(fd,), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -119,7 +122,7 @@ def read_browser_session(command, environment):
             try:
                 return wait_for_session(connection, process)
             except (EOFError, TimeoutError) as error:
-                raise SignInError("No session found. Close after YouTube Music opens.") from error
+                raise SignInError("Could not load the YouTube Music session. Try signing in again.") from error
             finally:
                 if process.poll() is None:
                     try:
@@ -136,14 +139,10 @@ def read_browser_session(command, environment):
 def wait_for_session(browser, process):
     target_id = None
     session = None
-    window_opened = False
     deadline = time.monotonic() + 15
     while process.poll() is None and time.monotonic() < deadline:
         targets = browser.call("Target.getTargets").get("targetInfos", [])
         pages = [target for target in targets if target["type"] == "page"]
-        if window_opened and not pages:
-            break
-        window_opened |= bool(pages)
         for target in pages:
             if not target["url"].startswith(ORIGIN + "/"):
                 continue
@@ -184,14 +183,14 @@ def wait_for_session(browser, process):
     raise EOFError
 
 
-def login():
+def login(on_closed):
     browser = os.getenv("LINTEL_LOGIN_BROWSER") or next(
         (path for name in ("chromium", "google-chrome", "helium") if (path := shutil.which(name))),
         None,
     )
     if not browser:
         raise FileNotFoundError("Set LINTEL_LOGIN_BROWSER to a Chromium browser")
-    headers = browser_session(browser)
+    headers = browser_session(browser, on_closed)
     client = YTMusic(headers)
     playlists = library_playlists(client)
     visitor = client.base_headers.get("X-Goog-Visitor-Id")
@@ -384,7 +383,7 @@ def main():
     CONFIG.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         if args.command == "login":
-            playlists = login()
+            playlists = login(lambda: print(flush=True) if args.library else None)
             cache_library(playlists)
             if args.library:
                 print(json.dumps(playlists, ensure_ascii=False))

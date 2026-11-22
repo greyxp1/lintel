@@ -412,19 +412,38 @@ fn run() -> Result<()> {
               continue;
             }
             state.library_refreshing = true;
-            state.signing_in = sign_in;
+            state.signing_in = sign_in.then_some(ui::SignInStage::Browser);
             if sign_in || !state.signed_in {
               state.playlist_error = None;
             }
             let revision = state.library_revision;
             drop(state);
+            let progress = sign_in.then(|| {
+              let (send, receive) = async_channel::bounded(1);
+              let model = model.clone();
+              let redraw = redraw.clone();
+              MainContext::default().spawn_local(async move {
+                if receive.recv().await.is_ok() {
+                  let mut state = model.borrow_mut();
+                  if state.library_revision == revision && state.signing_in.is_some() {
+                    state.signing_in = Some(ui::SignInStage::Library);
+                    drop(state);
+                    redraw();
+                  }
+                }
+              });
+              send
+            });
             let model = model.clone();
             let redraw = redraw.clone();
             let pinned = pinned.clone();
             background(
               move || {
-                if sign_in {
-                  media::sign_in().map_err(|error| error.to_string())
+                if let Some(progress) = progress {
+                  media::sign_in(|| {
+                    let _ = progress.try_send(());
+                  })
+                  .map_err(|error| error.to_string())
                 } else {
                   media::playlists().map_err(|error| error.to_string())
                 }
@@ -435,7 +454,7 @@ fn run() -> Result<()> {
                   return;
                 }
                 state.library_refreshing = false;
-                state.signing_in = false;
+                state.signing_in = None;
                 state.library_checked |= result.is_ok();
                 match result {
                   Ok(media::Library::Connected(lists)) => {
