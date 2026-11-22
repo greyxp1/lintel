@@ -2060,7 +2060,7 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       label(
         cr,
         if model.signing_in {
-          "Signing in…"
+          "Close the browser after signing in"
         } else if !model.library_checked {
           "Retry loading your library"
         } else if model.reconnect {

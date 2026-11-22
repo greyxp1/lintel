@@ -82,6 +82,17 @@ def browser_session(browser):
             browser, f"--user-data-dir={profile}", "--no-first-run",
             "--no-default-browser-check", "--disable-sync", "--disable-background-mode",
         ]
+        # Account sign-in runs in a normal browser window. Connect to the dedicated
+        # profile only after that window closes, to read the YouTube Music session.
+        try:
+            result = subprocess.run(
+                [*command, "--new-window", SIGN_IN_URL], env=environment, timeout=600,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise SignInError("YouTube Music sign-in timed out.") from error
+        if result.returncode:
+            raise SignInError("The sign-in browser closed unexpectedly.")
         return read_browser_session(command, environment)
 
 
@@ -96,7 +107,8 @@ def read_browser_session(command, environment):
         process = subprocess.Popen(
             [
                 "sh", "-c", f'exec {redirections}; exec "$@"', "lintel-login",
-                *command, "--remote-debugging-pipe", "--new-window", SIGN_IN_URL,
+                *command, "--restore-last-session", "--remote-debugging-pipe",
+                "--new-window", ORIGIN + "/",
             ],
             env=environment, pass_fds=(fd,), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -108,7 +120,7 @@ def read_browser_session(command, environment):
             try:
                 return wait_for_session(connection, process)
             except (EOFError, TimeoutError) as error:
-                raise SignInError("YouTube Music sign-in did not complete.") from error
+                raise SignInError("No session found. Close after YouTube Music opens.") from error
             finally:
                 if process.poll() is None:
                     try:
@@ -117,7 +129,7 @@ def read_browser_session(command, environment):
                     except (OSError, EOFError):
                         pass
                     try:
-                        process.wait(timeout=1)
+                        process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         process.kill()
 
@@ -126,7 +138,7 @@ def wait_for_session(browser, process):
     target_id = None
     session = None
     window_opened = False
-    deadline = time.monotonic() + 600
+    deadline = time.monotonic() + 15
     while process.poll() is None and time.monotonic() < deadline:
         targets = browser.call("Target.getTargets").get("targetInfos", [])
         pages = [target for target in targets if target["type"] == "page"]
