@@ -60,6 +60,9 @@ const POPUP_CLOSE_X: i32 = POPUP_WIDTH - 34;
 const POPUP_CLOSE_Y: i32 = 10;
 const POPUP_CLOSE_SIZE: i32 = 24;
 const AUDIO_NAME_X: i32 = PANEL_X + 43;
+const AUDIO_BUTTON_SIZE: i32 = 28;
+const AUDIO_BUTTON_X: i32 = AUDIO_NAME_X - 33;
+const AUDIO_DEVICES: [Device; 2] = [Device::Output, Device::Input];
 const APP_AUDIO_Y: i32 = 135;
 
 #[derive(Clone)]
@@ -345,6 +348,7 @@ pub struct Model {
   pub opacity: f64,
   hover: [Hover; 4],
   sign_in_hover: Hover,
+  audio_hover: [Hover; 2],
   pub playlist_epoch: u64,
   pub playlist_syncing: bool,
   pub playlist_error: Option<String>,
@@ -402,11 +406,16 @@ impl Model {
       && !self.playlist_busy
       && pointer.is_some_and(|(x, y)| self.sign_in_hit(x as i32, y as i32));
     changed |= self.sign_in_hover.update(sign_in);
+    for (index, hover) in self.audio_hover.iter_mut().enumerate() {
+      changed |= hover.update(self.panel == Panel::Audio && audio_button_hit(pointer, index));
+    }
     changed
   }
 
   pub fn hover_animating(&self) -> bool {
-    self.hover.iter().any(Hover::animating) || self.sign_in_hover.animating()
+    self.hover.iter().any(Hover::animating)
+      || self.sign_in_hover.animating()
+      || (self.panel == Panel::Audio && self.audio_hover.iter().any(Hover::animating))
   }
 
   pub fn set_streams(&mut self, streams: Vec<Stream>, music_only: bool) -> bool {
@@ -458,6 +467,7 @@ impl Model {
 
   pub fn select(&mut self, panel: Panel) {
     self.panel = panel;
+    self.audio_hover = Default::default();
     self.offset = 0;
     self.removal = None;
     self.seek_preview = None;
@@ -886,7 +896,18 @@ impl Model {
       }
       return None;
     }
-    if self.panel == Panel::Audio && (PANEL_X + 12..PANEL_X + PANEL_WIDTH - 12).contains(&x) {
+    if self.panel == Panel::Audio {
+      let pointer = Some((f64::from(x), f64::from(y)));
+      if let Some((_, device)) = AUDIO_DEVICES
+        .into_iter()
+        .enumerate()
+        .find(|(index, _)| audio_button_hit(pointer, *index))
+      {
+        return Some(Action::Volume(Slider::Device(device), None));
+      }
+      if !(PANEL_X + 12..PANEL_X + PANEL_WIDTH - 12).contains(&x) {
+        return None;
+      }
       let y = y - PANEL_Y;
       return match y {
         34..=68 => Slider::Device(Device::Output).pick(x, right),
@@ -1085,6 +1106,20 @@ impl Model {
 
 const SLIDER_X: i32 = PANEL_X + 135;
 const SLIDER_END: i32 = PANEL_X + PANEL_WIDTH - 48;
+
+fn audio_slider_y(index: usize) -> i32 {
+  PANEL_Y + 43 + index as i32 * 35
+}
+
+fn audio_button_hit(pointer: Option<(f64, f64)>, index: usize) -> bool {
+  inside(
+    pointer,
+    AUDIO_BUTTON_X,
+    audio_slider_y(index) + 3 - AUDIO_BUTTON_SIZE / 2,
+    AUDIO_BUTTON_SIZE,
+    AUDIO_BUTTON_SIZE,
+  )
+}
 
 fn popup_close_hit(x: i32, y: i32) -> bool {
   (POPUP_CLOSE_X..POPUP_CLOSE_X + POPUP_CLOSE_SIZE).contains(&x)
@@ -1967,9 +2002,34 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       .into_iter()
       .enumerate()
     {
-      let y = PANEL_Y + 43 + index as i32 * 35;
-      color(cr, 0xcdd6f4, 1.0);
-      paint_audio_device(cr, f64::from(AUDIO_NAME_X - 19), f64::from(y + 3), device)?;
+      let y = audio_slider_y(index);
+      let center = y + 3;
+      let x = f64::from(AUDIO_BUTTON_X + AUDIO_BUTTON_SIZE / 2);
+      let hovered = model.audio_hover[index].opacity();
+      let muted = volume.is_some_and(|volume| volume.muted);
+      round(
+        cr,
+        AUDIO_BUTTON_X,
+        center - AUDIO_BUTTON_SIZE / 2,
+        AUDIO_BUTTON_SIZE,
+        AUDIO_BUTTON_SIZE,
+        6.0,
+      );
+      color(cr, if muted { 0xf38ba8 } else { 0xcdd6f4 }, 0.16 * hovered);
+      cr.fill()?;
+      let center = f64::from(center);
+      color(
+        cr,
+        if muted { 0xf38ba8 } else { 0xcdd6f4 },
+        0.82 + 0.18 * hovered,
+      );
+      paint_audio_device(cr, x, center, device)?;
+      if muted {
+        cr.set_line_width(1.5);
+        cr.move_to(x - 8.0, center + 8.0);
+        cr.line_to(x + 8.0, center - 8.0);
+        cr.stroke()?;
+      }
       let slider = Slider::Device(device);
       draw_volume(cr, y, slider, model.volume(slider, volume).as_ref())?;
     }
