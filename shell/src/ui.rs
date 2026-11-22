@@ -74,6 +74,7 @@ pub struct Notice {
   pub id: u32,
   pub summary: String,
   pub body: String,
+  pub source: Option<String>,
   pub actions: Vec<(String, String)>,
   pub live: bool,
   pub popup: bool,
@@ -241,6 +242,7 @@ pub enum Action {
   ToggleMic,
   ToggleMonitor,
   ToggleDoNotDisturb,
+  ClearNotifications,
   Close(u32),
   PopupHover,
   Invoke(u32, String),
@@ -946,16 +948,15 @@ impl Model {
       if popup_close_hit(x, y) || right {
         return Some(Action::Close(notice.id));
       }
-      if (78..104).contains(&y) {
-        let index = usize::from(x >= POPUP_WIDTH / 2);
-        let left = index as i32 * (POPUP_WIDTH / 2) + 12;
-        if (left..left + POPUP_WIDTH / 2 - 24).contains(&x)
-          && let Some((key, _)) = notice
-            .actions
-            .iter()
-            .filter(|(key, _)| key != "default")
-            .nth(index)
-        {
+      for (index, (key, _)) in notice.popup_actions().enumerate() {
+        let left = POPUP_PADDING + index as i32 * (POPUP_ACTION_WIDTH + 8);
+        if inside(
+          Some((x.into(), y.into())),
+          left,
+          POPUP_ACTION_Y,
+          POPUP_ACTION_WIDTH,
+          22,
+        ) {
           return Some(Action::Invoke(notice.id, key.clone()));
         }
       }
@@ -1193,9 +1194,16 @@ impl Model {
     }
     if self.panel == Panel::History
       && !right
-      && inside(Some((x.into(), y.into())), DND_X, PANEL_Y + 5, 132, 26)
+      && !self.notices.is_empty()
+      && inside(
+        Some((x.into(), y.into())),
+        CLEAR_X,
+        PANEL_Y + 5,
+        CLEAR_WIDTH,
+        26,
+      )
     {
-      return Some(Action::ToggleDoNotDisturb);
+      return Some(Action::ClearNotifications);
     }
     let row = y - PANEL_Y - 34;
     if row < 0 {
@@ -1235,7 +1243,29 @@ impl Model {
 
 const SLIDER_X: i32 = PANEL_X + 135;
 const MONITOR_X: i32 = PANEL_X + PANEL_WIDTH - 40;
-const DND_X: i32 = PANEL_X + PANEL_WIDTH - 144;
+const CLEAR_WIDTH: i32 = 80;
+const CLEAR_X: i32 = PANEL_X + PANEL_WIDTH - CLEAR_WIDTH - 12;
+const POPUP_ACTION_Y: i32 = 83;
+const POPUP_ACTION_WIDTH: i32 = 104;
+const POPUP_PADDING: i32 = 14;
+
+impl Notice {
+  fn popup_text_x(&self) -> i32 {
+    if self.image.is_some() {
+      62
+    } else {
+      POPUP_PADDING
+    }
+  }
+
+  fn popup_actions(&self) -> impl Iterator<Item = &(String, String)> {
+    self
+      .actions
+      .iter()
+      .filter(|(key, _)| key != "default")
+      .take(2)
+  }
+}
 fn monitor_hit(pointer: Option<(f64, f64)>) -> bool {
   inside(pointer, MONITOR_X, PANEL_Y + 5, 28, 28)
 }
@@ -1418,6 +1448,7 @@ struct LabelKey {
   width: i32,
   align: Alignment,
   scale: u64,
+  lines: i32,
 }
 
 thread_local! {
@@ -1432,6 +1463,18 @@ fn label(
   weight: Weight,
   align: Alignment,
 ) {
+  label_lines(cr, text, rect, size, weight, align, 1);
+}
+
+fn label_lines(
+  cr: &Context,
+  text: &str,
+  rect: (i32, i32, i32),
+  size: i32,
+  weight: Weight,
+  align: Alignment,
+  lines: i32,
+) {
   let (x, y, width) = rect;
   let create = || {
     let layout = text_layout(cr, text, size, weight);
@@ -1439,6 +1482,10 @@ fn label(
       layout.set_width(width * SCALE);
       layout.set_ellipsize(EllipsizeMode::End);
       layout.set_alignment(align);
+      if lines > 1 {
+        layout.set_wrap(pango::WrapMode::WordChar);
+        layout.set_height(-lines);
+      }
     }
     layout
   };
@@ -1462,6 +1509,7 @@ fn label(
     width,
     align,
     scale: cr.matrix().xx().to_bits(),
+    lines,
   };
   LABEL_LAYOUTS.with_borrow_mut(|layouts| {
     if let Some(layout) = layouts.get(&key) {
@@ -2373,36 +2421,22 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       Weight::Semibold,
       Alignment::Left,
     );
-    let dnd_y = PANEL_Y + 5;
-    let hovered = inside(model.bar_pointer, DND_X, dnd_y, 132, 26);
-    round(cr, DND_X, dnd_y, 132, 26, 6.0);
-    color(
-      cr,
-      if model.do_not_disturb {
-        0xcba6f7
-      } else {
-        0xcdd6f4
-      },
-      if hovered { 0.26 } else { 0.14 },
-    );
-    cr.fill()?;
-    color(
-      cr,
-      if model.do_not_disturb {
-        0xcba6f7
-      } else {
-        0xcdd6f4
-      },
-      1.0,
-    );
-    label(
-      cr,
-      "Do Not Disturb",
-      (DND_X, dnd_y + 5, 132),
-      12,
-      Weight::Semibold,
-      Alignment::Center,
-    );
+    if !model.notices.is_empty() {
+      let y = PANEL_Y + 5;
+      let hovered = inside(model.bar_pointer, CLEAR_X, y, CLEAR_WIDTH, 26);
+      round(cr, CLEAR_X, y, CLEAR_WIDTH, 26, 6.0);
+      color(cr, 0xcdd6f4, if hovered { 0.22 } else { 0.11 });
+      cr.fill()?;
+      color(cr, 0xcdd6f4, 1.0);
+      label(
+        cr,
+        "Clear all",
+        (CLEAR_X, y + 5, CLEAR_WIDTH),
+        12,
+        Weight::Semibold,
+        Alignment::Center,
+      );
+    }
     for (row, notice) in model
       .history()
       .skip(model.offset)
@@ -2564,55 +2598,61 @@ fn paint_popup(
   color(cr, 0xcba6f7, 0.46);
   cr.set_line_width(1.0);
   cr.stroke()?;
-  let text_x = if let Some(icon) = &notice.image {
-    picture(cr, Some(icon), 14, 14, 42, "")?;
-    65
-  } else {
-    14
-  };
+  let text_x = notice.popup_text_x();
+  if let Some(icon) = &notice.image {
+    picture(cr, Some(icon), POPUP_PADDING, 14, 36, "")?;
+  }
+  let source = notice.source.as_deref();
   color(cr, 0xcdd6f4, 1.0);
+  let has_header = notice.image.is_some() || source.is_some();
   label(
     cr,
     &notice.summary,
-    (text_x, 13, POPUP_WIDTH - text_x - 38),
+    (text_x, 12, POPUP_WIDTH - text_x - 38),
     16,
     Weight::Semibold,
     Alignment::Left,
   );
   dismissal(cr, POPUP_CLOSE_X, POPUP_CLOSE_Y, close_hovered)?;
-  color(cr, 0xcdd6f4, 1.0);
-  for (row, line) in notice
-    .body
-    .lines()
-    .filter(|line| !line.trim().is_empty())
-    .take(2)
-    .enumerate()
-  {
+  if let Some(source) = source {
+    color(cr, 0xa6adc8, 1.0);
     label(
       cr,
-      line,
-      (text_x, 40 + row as i32 * 18, POPUP_WIDTH - text_x - 14),
-      14,
+      source,
+      (text_x, 32, POPUP_WIDTH - text_x - 14),
+      11,
       Weight::Normal,
       Alignment::Left,
     );
   }
-  for (index, (_, action)) in notice
-    .actions
-    .iter()
-    .filter(|(key, _)| key != "default")
-    .take(2)
-    .enumerate()
-  {
-    let x = index as i32 * (POPUP_WIDTH / 2) + 12;
-    color(cr, 0x313244, 1.0);
-    round(cr, x, 78, POPUP_WIDTH / 2 - 24, 26, 6.0);
+  color(cr, 0xcdd6f4, 1.0);
+  label_lines(
+    cr,
+    &notice.body,
+    (
+      POPUP_PADDING,
+      if has_header { 51 } else { 36 },
+      POPUP_WIDTH - 2 * POPUP_PADDING,
+    ),
+    13,
+    Weight::Normal,
+    Alignment::Left,
+    if notice.popup_actions().next().is_none() && !has_header {
+      3
+    } else {
+      2
+    },
+  );
+  for (index, (_, action)) in notice.popup_actions().enumerate() {
+    let x = POPUP_PADDING + index as i32 * (POPUP_ACTION_WIDTH + 8);
+    color(cr, 0x45475a, 0.70);
+    round(cr, x, POPUP_ACTION_Y, POPUP_ACTION_WIDTH, 22, 6.0);
     cr.fill()?;
     color(cr, 0xcdd6f4, 1.0);
     label(
       cr,
       action,
-      (x, 83, POPUP_WIDTH / 2 - 24),
+      (x + 6, POPUP_ACTION_Y + 3, POPUP_ACTION_WIDTH - 12),
       12,
       Weight::Semibold,
       Alignment::Center,

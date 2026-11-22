@@ -684,6 +684,7 @@ fn run() -> Result<()> {
           Action::Close(id) => services.close(id, 2),
           Action::PopupHover => services.hover_popup(),
           Action::ToggleDoNotDisturb => services.toggle_do_not_disturb(),
+          Action::ClearNotifications => services.clear_notifications(),
           Action::Invoke(id, action) => services.invoke(id, &action),
           Action::Tray(address, method) => services.tray_action(&address, method),
         }

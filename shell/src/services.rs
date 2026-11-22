@@ -324,10 +324,18 @@ impl Services {
     let duration = (timeout != 0)
       .then(|| Duration::from_millis(if timeout < 0 { 5500 } else { timeout as u64 }));
     let popup = !model.do_not_disturb;
+    let text: String = args.child_get::<String>(4).chars().take(1024).collect();
+    let (source, message) = text
+      .split_once("\n\n")
+      .filter(|(source, _)| source.contains('.') && !source.chars().any(char::is_whitespace))
+      .map_or((None, text.as_str()), |(source, message)| {
+        (Some(source.to_owned()), message)
+      });
     model.notices.push_front(Notice {
       id,
       summary: args.child_get::<String>(3).chars().take(256).collect(),
-      body: args.child_get::<String>(4).chars().take(1024).collect(),
+      body: message.split_whitespace().collect::<Vec<_>>().join(" "),
+      source,
       actions,
       live: true,
       popup,
@@ -438,6 +446,19 @@ impl Services {
 
   pub fn close(self: &Rc<Self>, id: u32, reason: u32) {
     self.finish_notice(id, reason, reason == 2);
+  }
+
+  pub fn clear_notifications(self: &Rc<Self>) {
+    let mut model = self.model.borrow_mut();
+    for notice in model.notices.drain(..) {
+      self.cancel_expiry(notice.id);
+      if notice.live {
+        self.closed_signal(notice.id, 2);
+      }
+    }
+    model.select(crate::ui::Panel::History);
+    drop(model);
+    self.hover_popup();
   }
 
   fn finish_notice(self: &Rc<Self>, id: u32, reason: u32, dismiss: bool) {
