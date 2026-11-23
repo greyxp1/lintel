@@ -29,6 +29,7 @@ OAUTH = CONFIG / "youtube-oauth.json"
 SESSION = CONFIG / "youtube-browser.json"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "lintel" / "playlists"
 LIBRARY = CACHE.parent / "library.json"
+LYRIC_CACHE = CACHE.parent / "lyrics"
 ORIGIN = "https://music.youtube.com"
 SIGN_IN_URL = (
     "https://accounts.google.com/ServiceLogin?ltmpl=music&service=youtube&passive=true"
@@ -386,10 +387,45 @@ def normalized(text):
 
 
 def recording_title(title):
-    # Providers may list featured artists separately from the recording title.
-    # Keep suffixes that identify the version, including remix and live labels.
-    return re.sub(r"\s*[\[(](?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]\s*$",
-                  "", title, flags=re.IGNORECASE).strip()
+    # Credits and video decorations do not identify the recording version.
+    title = re.sub(r"\s*[\[(](?:(?:feat\.?|ft\.?|featuring)\s+[^)\]]+|official (?:music )?video|official audio|lyrics?)[)\]]",
+                   "", title, flags=re.IGNORECASE)
+    return re.sub(r"\s+[-–—]\s+(?:feat\.?|ft\.?|featuring)\s+.+$", "", title,
+                  flags=re.IGNORECASE).strip()
+
+
+def artist_names(artist):
+    parts = re.split(r"[,;&、]|\s+(?:feat\.?|ft\.?|featuring)\s+", artist, flags=re.IGNORECASE)
+    return {name for part in parts if (name := normalized(part))}
+
+
+def lrc_lines(text):
+    lines = []
+    for row in text.splitlines():
+        stamp = re.fullmatch(r"\[(\d+):(\d+(?:\.\d+)?)\]\s*(.+)", row)
+        if stamp:
+            lines.append({"text": stamp[3], "start": int(stamp[1]) * 60 + float(stamp[2])})
+    return sorted(lines, key=lambda line: line["start"])
+
+
+def lrclib_lyrics(title, artist, duration):
+    query = urlencode({"track_name": title, "artist_name": artist})
+    request = Request("https://lrclib.net/api/search?" + query, headers={"User-Agent": "Lintel"})
+    with urlopen(request, timeout=3) as response:
+        matches = json.loads(response.read(1_000_000))
+    wanted = artist_names(artist)
+    best = None
+    for item in matches:
+        if normalized(recording_title(item.get("trackName") or "")) != normalized(title):
+            continue
+        common = wanted & artist_names(item.get("artistName") or "")
+        drift = abs((item.get("duration") or 0) - duration)
+        if common and drift <= 3 and (lines := lrc_lines(item.get("syncedLyrics") or "")):
+            score = (-len(common), drift)
+            if best is None or score < best[0]:
+                best = (score, lines)
+    if best:
+        return {"source": "LRCLIB", "lines": best[1]}
 
 
 def netease_request(path, **params):
@@ -400,7 +436,7 @@ def netease_request(path, **params):
 
 
 def netease_lyrics(title, artist, duration):
-    artists = {name for part in artist.split(",") if (name := normalized(part))}
+    artists = artist_names(artist)
     if not artists:
         return None
     try:
@@ -410,10 +446,10 @@ def netease_lyrics(title, artist, duration):
     matches = []
     for song in (reply.get("result") or {}).get("songs") or []:
         try:
-            names = {normalized(person["name"]) for person in song["artists"]}
+            names = set().union(*(artist_names(person["name"]) for person in song["artists"]))
             drift = abs(song["duration"] / 1000 - duration)
-            if normalized(recording_title(song["name"])) == normalized(title) and artists <= names and drift <= 3:
-                matches.append((len(names - artists), drift, song["id"]))
+            if normalized(recording_title(song["name"])) == normalized(title) and artists & names and drift <= 3:
+                matches.append((-len(names & artists), drift, song["id"]))
         except (KeyError, TypeError, AttributeError):
             continue
     for _, _, song in sorted(matches)[:2]:
@@ -436,8 +472,8 @@ def kugou_lyrics(title, artist, duration):
             item for item in response.get("candidates", [])
             if item.get("krctype") == 2
             and normalized(recording_title(item["song"])) == normalized(title)
-            and normalized(item["singer"]) == normalized(artist)
-            and abs(item["duration"] - length) <= 8000
+            and artist_names(item["singer"]) & artist_names(artist)
+            and abs(item["duration"] - length) <= 3000
         ]
         match = min(matches, key=lambda item: abs(item["duration"] - length), default=None)
         if match:
@@ -466,17 +502,20 @@ def word_lyrics(title, artist, duration):
         finally:
             replies.put(result)
 
-    for provider in (netease_lyrics, kugou_lyrics):
+    for provider in (netease_lyrics, kugou_lyrics, lrclib_lyrics):
         Thread(target=lookup, args=(provider,), daemon=True).start()
     deadline = time.monotonic() + 5
-    for _ in range(2):
+    line_timed = None
+    for _ in range(3):
         try:
             result = replies.get(timeout=max(0, deadline - time.monotonic()))
         except Empty:
             break
-        if result:
+        if result and any(line.get("words") for line in result["lines"]):
             return result
-    return None
+        if result:
+            line_timed = result
+    return line_timed
 
 
 def song_lyrics(yt, args):
@@ -528,6 +567,33 @@ def handle(yt, args):
     return None
 
 
+def lyric_cache_path(video_id):
+    return LYRIC_CACHE / hashlib.sha256(video_id.encode()).hexdigest()
+
+
+def read_cached_lyrics(path):
+    try:
+        age = time.time() - path.stat().st_mtime
+        reply = json.loads(path.read_text())
+        if age < (30 * 86400 if reply["word_timed"] else 86400):
+            return reply
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def keep_lyrics(path, result):
+    try:
+        word_timed = any(line.get("words") for line in (result or {}).get("lines", []))
+        save_json(path, {"word_timed": word_timed, "result": result})
+        files = [entry for entry in LYRIC_CACHE.iterdir() if entry.is_file()]
+        if len(files) > 128:
+            for entry in sorted(files, key=lambda item: item.stat().st_mtime)[:-128]:
+                entry.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(prog="lintel music", description="YouTube Music library")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -563,10 +629,17 @@ def main():
             if args.library:
                 print(json.dumps(playlists, ensure_ascii=False))
         else:
-            if args.command == "lyrics" and args.title is not None:
-                words = word_lyrics(args.title, args.artist, args.duration)
-                if words:
-                    print(json.dumps(words, ensure_ascii=False))
+            lyric_path = None
+            if args.command == "lyrics" and args.title and args.artist and args.duration > 0:
+                lyric_path = lyric_cache_path(args.video_id)
+                cached = read_cached_lyrics(lyric_path)
+                if cached is not None:
+                    print(json.dumps(cached["result"], ensure_ascii=False))
+                    return 0
+                timed = word_lyrics(args.title, args.artist, args.duration)
+                if timed:
+                    keep_lyrics(lyric_path, timed)
+                    print(json.dumps(timed, ensure_ascii=False))
                     return 0
             if args.command == "playlist" and args.prefer_cache:
                 cached = cached_playlist(cache_file(args.playlist_id))
@@ -594,6 +667,8 @@ def main():
                             save_json(SESSION, headers)
                         except OSError:
                             pass
+                if lyric_path is not None:
+                    keep_lyrics(lyric_path, result)
                 print(json.dumps(result, ensure_ascii=False))
     except (SignInError, PlaylistEditError) as error:
         print(error, file=sys.stderr)

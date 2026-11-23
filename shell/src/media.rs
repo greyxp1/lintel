@@ -52,6 +52,8 @@ impl Track {
 #[derive(Clone, PartialEq)]
 pub struct QueueSong {
   pub title: String,
+  pub artist: String,
+  pub seconds: i32,
   pub art: String,
 }
 
@@ -218,6 +220,8 @@ fn subscribe(socket: &Path, updates: &async_channel::Sender<Track>) -> MediaResu
                 .filter(|song| !song.title.is_empty())
                 .map_or_else(|| "Unknown track".into(), |song| song.title.clone()),
               art: song.map_or_else(String::new, |song| song.art.clone()),
+              artist: song.map_or_else(String::new, |song| song.artist.clone()),
+              seconds: song.map_or(0, |song| song.seconds),
             }
           })
           .collect(),

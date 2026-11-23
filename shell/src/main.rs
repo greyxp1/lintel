@@ -458,7 +458,7 @@ fn run() -> Result<()> {
             fetch_small_covers(&model, &redraw);
             let lyrics = {
               let state = model.borrow();
-              state.music_tab == MusicTab::Lyrics && state.signed_in
+              state.signed_in
             };
             if lyrics {
               fetch_lyrics(&model, &redraw);
@@ -540,6 +540,9 @@ fn run() -> Result<()> {
                 drop(state);
                 fetch_art(&model, &redraw);
                 fetch_small_covers(&model, &redraw);
+                if model.borrow().signed_in {
+                  fetch_lyrics(&model, &redraw);
+                }
                 redraw();
               },
             );
@@ -850,6 +853,7 @@ async fn watch_tracks(
   socket: PathBuf,
 ) {
   let mut restore_attempted = false;
+  let mut prefetched_song = String::new();
   while let Ok(next) = updates.recv().await {
     let mut state = model.borrow_mut();
     if state.track == next {
@@ -899,8 +903,33 @@ async fn watch_tracks(
     state.update_track(next);
     let expanded = state.panel == Panel::Music;
     let art_changed = previous_art != state.cover_url();
-    let lyrics =
-      expanded && state.music_tab == MusicTab::Lyrics && (track_changed || lyric_metadata_loaded);
+    let lyrics = state.signed_in
+      && (track_changed || lyric_metadata_loaded)
+      && (state.track.has_lyric_metadata() || (expanded && state.music_tab == MusicTab::Lyrics));
+    let upcoming = state.track.queue_index.saturating_add(1);
+    if state.signed_in
+      && state.track.playing
+      && let Some(id) = state.track.queue.get(upcoming)
+      && id != &prefetched_song
+      && id != &state.track.id
+      && let Some(song) = state.track.queue_songs.get(upcoming)
+      && !song.artist.is_empty()
+      && song.seconds > 0
+    {
+      prefetched_song.clone_from(id);
+      let (id, title, artist, duration) = (
+        id.clone(),
+        song.title.clone(),
+        song.artist.clone(),
+        song.seconds,
+      );
+      background(
+        move || {
+          let _ = media::lyrics(&id, &title, &artist, f64::from(duration));
+        },
+        |_| {},
+      );
+    }
     drop(state);
     if lyrics {
       fetch_lyrics(&model, &refresh);
@@ -1289,7 +1318,9 @@ fn fetch_lyrics(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   state.lyrics_metadata = with_metadata;
   state.lyrics = Default::default();
   state.lyrics_status = Some("Loading lyrics…".into());
-  state.reset_music_scroll();
+  if state.music_tab == MusicTab::Lyrics {
+    state.reset_music_scroll();
+  }
   drop(state);
   let model = model.clone();
   let refresh = refresh.clone();
