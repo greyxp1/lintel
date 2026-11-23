@@ -35,17 +35,23 @@ struct Buffer {
 enum Damage {
   #[default]
   Clean,
-  Region(ui::BarRegion),
+  Partial([Option<ui::BarRegion>; 3]),
   Full,
 }
 
 impl Damage {
   fn add(&mut self, region: ui::BarRegion) {
-    *self = match *self {
-      Self::Clean => Self::Region(region),
-      Self::Region(pending) if pending == region => *self,
-      _ => Self::Full,
-    };
+    match self {
+      Self::Clean => *self = Self::Partial([Some(region), None, None]),
+      Self::Partial(regions) if !regions.contains(&Some(region)) => {
+        if let Some(slot) = regions.iter_mut().find(|slot| slot.is_none()) {
+          *slot = Some(region);
+        } else {
+          *self = Self::Full;
+        }
+      }
+      _ => {}
+    }
   }
 }
 
@@ -581,7 +587,11 @@ impl Desktop {
         buffer.damage = Damage::Full;
       } else {
         match surface.damage {
-          Damage::Region(region) => buffer.damage.add(region),
+          Damage::Partial(regions) => {
+            for region in regions.into_iter().flatten() {
+              buffer.damage.add(region);
+            }
+          }
           Damage::Full => buffer.damage = Damage::Full,
           Damage::Clean => {}
         }
@@ -623,18 +633,22 @@ impl Desktop {
     let buffer = &mut surface.backing[index];
     let cr = Context::new(&buffer.image)?;
     cr.scale(f64::from(scale), f64::from(scale));
-    if let Damage::Region(region) = buffer.damage {
-      let (x, y, w, h) = region.bounds(model);
-      cr.rectangle(f64::from(x), f64::from(y), f64::from(w), f64::from(h));
-      cr.clip();
-      region.paint(&cr, model)?;
+    if let Damage::Partial(regions) = buffer.damage {
+      for region in regions.into_iter().flatten() {
+        let (x, y, w, h) = region.bounds(model);
+        cr.save()?;
+        cr.rectangle(f64::from(x), f64::from(y), f64::from(w), f64::from(h));
+        cr.clip();
+        region.paint(&cr, model)?;
+        cr.restore()?;
+        surface
+          .surface
+          .damage_buffer(x * scale, y * scale, w * scale, h * scale);
+      }
       drop(cr);
       buffer.image.flush();
       surface.surface.attach(Some(&buffer.handle), 0, 0);
-      surface
-        .surface
-        .damage_buffer(x * scale, y * scale, w * scale, h * scale);
-      if model.lyric_scroll_animating() && surface.frame.is_none() {
+      if kind == Layer::Bar && surface.frame.is_none() && music_frame(model) {
         surface.frame = Some(surface.surface.frame(qh, kind));
       }
       surface.surface.commit();
@@ -765,7 +779,7 @@ impl Desktop {
     if surface.frame.is_none()
       && match kind {
         Layer::Popup => model.timed_popups(),
-        Layer::Bar => model.lyric_scroll_animating(),
+        Layer::Bar => music_frame(model),
         _ => false,
       }
     {
@@ -916,6 +930,12 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, Layer> for Desktop {
   }
 }
 
+fn music_frame(model: &Model) -> bool {
+  model.lyric_scroll_animating()
+    || model.music_marquee(ui::BarRegion::MusicTitle)
+    || model.music_marquee(ui::BarRegion::MusicList)
+}
+
 impl Dispatch<wl_callback::WlCallback, Layer> for Desktop {
   fn event(
     state: &mut Self,
@@ -925,16 +945,29 @@ impl Dispatch<wl_callback::WlCallback, Layer> for Desktop {
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
-    let (animate, lyrics) = {
+    let (animate, lyrics, title, list) = {
       let model = state.model.borrow();
-      (model.timed_popups(), model.lyrics_view())
+      (
+        model.timed_popups(),
+        model.lyric_scroll_animating(),
+        model.music_marquee(ui::BarRegion::MusicTitle),
+        model.music_marquee(ui::BarRegion::MusicList),
+      )
     };
     if let Some(surface) = state.surface(*kind)
       && surface.frame.as_ref() == Some(callback)
     {
       surface.frame = None;
-      if *kind == Layer::Bar && lyrics {
-        surface.damage.add(ui::BarRegion::Lyrics);
+      if *kind == Layer::Bar {
+        for (active, region) in [
+          (lyrics, ui::BarRegion::Lyrics),
+          (title, ui::BarRegion::MusicTitle),
+          (list, ui::BarRegion::MusicList),
+        ] {
+          if active {
+            surface.damage.add(region);
+          }
+        }
       } else if *kind == Layer::Popup {
         surface.dirty |= animate;
       }

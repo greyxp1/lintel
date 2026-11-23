@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,15 +38,16 @@ const SAVE_WIDTH: i32 = 55;
 const SAVE_X: i32 = PLAYER_X - SAVE_WIDTH - 12;
 const LIST_Y: i32 = PANEL_Y + 60;
 const MUSIC_BOTTOM: i32 = TRANSPORT_END + 82;
-const TAB_END: i32 = MUSIC_BOTTOM - 12;
+const TAB_END: i32 = MUSIC_BOTTOM - 3;
 const SEARCH_END: i32 = TAB_END - 22;
-const MUSIC_GAIN_START: i32 = PLAYER_X + 42;
+const MUSIC_GAIN_START: i32 = PLAYER_X + 100;
 const MUSIC_GAIN_END: i32 = PLAYER_X + PLAYER_WIDTH - 56;
 const LYRICS_SHIFT: i32 = 174;
 const LYRICS_LEFT: i32 = MUSIC_LEFT + 12;
 const LYRICS_WIDTH: i32 = WIDTH - 2 * LYRICS_LEFT;
 const LYRICS_TOP: i32 = LIST_Y + 20;
-const LYRICS_BOTTOM: i32 = 447;
+const LYRICS_BOTTOM: i32 = 473;
+const LYRICS_FOOTER_Y: i32 = 480;
 const RESULTS_Y: i32 = LIST_Y + 41;
 const RESULTS_ROW: i32 = 46;
 const SEARCH_ROWS: usize = ((SEARCH_END - RESULTS_Y) / RESULTS_ROW) as usize;
@@ -59,7 +60,7 @@ pub const CORNER_SIZE: i32 = 20;
 pub const PANEL_WIDTH: i32 = HEADER_WIDTH - 2 * WING;
 const PANEL_X: i32 = (WIDTH - PANEL_WIDTH) / 2;
 const PANEL_Y: i32 = HEIGHT;
-const COVER: i32 = 184;
+const COVER: i32 = 160;
 
 const ROW_HEIGHT: i32 = 40;
 const VISIBLE_ROWS: usize = 6;
@@ -74,6 +75,7 @@ const SIGN_IN_X: i32 = PANEL_X + 16;
 const SIGN_IN_Y: i32 = PANEL_Y + 12;
 const SIGN_IN_WIDTH: i32 = PANEL_WIDTH - 32;
 const SIGN_IN_BUTTON_HEIGHT: i32 = 38;
+const SIGN_OUT_Y: i32 = TAB_Y;
 const PLAYER_SIGN_OUT_X: i32 = PLAYER_X + PLAYER_WIDTH - TAB_WIDTH - 12;
 const PLAYER_REMOVE_X: i32 = PLAYER_X + PLAYER_WIDTH - TAB_WIDTH - 15;
 const SIGN_OUT_WIDTH: i32 = 38;
@@ -435,6 +437,10 @@ pub struct Model {
   popup_pointer: Option<(f64, f64)>,
   popup_close_hover: Option<u32>,
   bar_pointer: Option<(f64, f64)>,
+  title_scroll: Cell<Option<Instant>>,
+  row_scroll: Cell<Option<(usize, Instant)>>,
+  title_animating: Cell<bool>,
+  row_animating: Cell<bool>,
   pub audio_setting: bool,
   pub audio_revision: u64,
   pub mic_route: bool,
@@ -472,6 +478,9 @@ impl Model {
       && self.bar_pointer != pointer;
     changed |= self.panel == Panel::Audio && monitor_hit(self.bar_pointer) != monitor_hit(pointer);
     self.bar_pointer = pointer;
+    if pointer.is_none() {
+      self.row_scroll.set(None);
+    }
     for (left, hover) in BUTTONS.into_iter().zip(&mut self.hover) {
       let active = pointer.is_some_and(|(x, y)| {
         y >= 0.0
@@ -557,6 +566,15 @@ impl Model {
 
   pub fn lyrics_view(&self) -> bool {
     self.wide_music() && self.music_tab == MusicTab::Lyrics
+  }
+
+  pub fn music_marquee(&self, region: BarRegion) -> bool {
+    self.wide_music()
+      && match region {
+        BarRegion::MusicTitle => self.title_animating.get(),
+        BarRegion::MusicList => !self.lyrics_view() && self.row_animating.get(),
+        _ => false,
+      }
   }
 
   fn player_shift(&self) -> i32 {
@@ -659,6 +677,8 @@ impl Model {
       self.mark_visible_notices_seen();
     }
     self.panel = panel;
+    self.title_scroll.set(None);
+    self.row_scroll.set(None);
     self.playlist_target = None;
     self.search_row = None;
     self.lyrics_scrolled = false;
@@ -992,6 +1012,7 @@ impl Model {
 
   pub fn update_track(&mut self, track: Track) {
     if self.track.id != track.id {
+      self.title_scroll.set(None);
       self.pending_seek = None;
     }
     if self.track.player_pid != track.player_pid {
@@ -1109,6 +1130,7 @@ impl Model {
     }
     let tab = *MUSIC_TABS.get(index)?;
     self.music_tab = tab;
+    self.row_scroll.set(None);
     self.playlist_target = None;
     self.search_row = None;
     self.reset_music_scroll();
@@ -1389,14 +1411,13 @@ impl Model {
         return (!self.library_refreshing && !self.playlist_busy && self.sign_in_hit(x, y))
           .then_some(Action::SignIn);
       }
-      if !self.lyrics_view()
-        && !self.playlist_busy
+      if !self.playlist_busy
         && inside(
           Some((f64::from(x), f64::from(y))),
           PLAYER_SIGN_OUT_X,
-          PANEL_Y + 6,
+          SIGN_OUT_Y,
           TAB_WIDTH,
-          27,
+          MUSIC_TAB_HEIGHT,
         )
       {
         self.confirmation = Some(MusicConfirmation::SignOut);
@@ -2047,6 +2068,163 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
   Ok(())
 }
 
+fn edge_mask(
+  first: f64,
+  last: f64,
+  leading: bool,
+  trailing: bool,
+  horizontal: bool,
+) -> cairo::LinearGradient {
+  let mask = if horizontal {
+    cairo::LinearGradient::new(first, 0.0, last, 0.0)
+  } else {
+    cairo::LinearGradient::new(0.0, first, 0.0, last)
+  };
+  let fade = if horizontal { 16.0 } else { 48.0 };
+  mask.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, if leading { 0.0 } else { 1.0 });
+  mask.add_color_stop_rgba((fade / (last - first)).min(0.5), 0.0, 0.0, 0.0, 1.0);
+  mask.add_color_stop_rgba(1.0 - (fade / (last - first)).min(0.5), 0.0, 0.0, 0.0, 1.0);
+  mask.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, if trailing { 0.0 } else { 1.0 });
+  mask
+}
+
+fn marquee(
+  cr: &Context,
+  text: &str,
+  rect: (i32, i32, i32),
+  size: i32,
+  weight: Weight,
+  centered: bool,
+  started: Option<Instant>,
+) -> cairo::Result<bool> {
+  let (x, y, width) = rect;
+  let layout = LABEL_LAYOUTS.with_borrow_mut(|layouts| {
+    let key = LabelKey {
+      text: text.to_owned(),
+      size,
+      weight,
+      width: -1,
+      align: Alignment::Left,
+      scale: cr.matrix().xx().to_bits(),
+      lines: 1,
+    };
+    if layouts.len() >= 256 {
+      layouts.clear();
+    }
+    layouts
+      .entry(key)
+      .or_insert_with(|| text_layout(cr, text, size, weight))
+      .clone()
+  });
+  let (measured, height) = layout.pixel_size();
+  if measured <= width {
+    let x = if centered {
+      x + (width - measured) / 2
+    } else {
+      x
+    };
+    cr.move_to(f64::from(x), f64::from(y));
+    pangocairo::functions::show_layout(cr, &layout);
+    return Ok(false);
+  }
+  let distance = f64::from(measured - width);
+  let duration = distance / 42.0;
+  let offset = started.map_or(0.0, |time| {
+    let phase = time.elapsed().as_secs_f64() % (2.0 * duration + 2.0);
+    if phase < 1.0 + duration {
+      ((phase - 1.0) * 42.0).clamp(0.0, distance)
+    } else {
+      (distance - (phase - 2.0 - duration) * 42.0).clamp(0.0, distance)
+    }
+  });
+  cr.save()?;
+  cr.rectangle(
+    f64::from(x),
+    f64::from(y),
+    f64::from(width),
+    f64::from(height + 2),
+  );
+  cr.clip();
+  cr.push_group();
+  cr.move_to(f64::from(x) - offset, f64::from(y));
+  pangocairo::functions::show_layout(cr, &layout);
+  cr.pop_group_to_source()?;
+  cr.mask(&edge_mask(
+    f64::from(x),
+    f64::from(x + width),
+    offset > 0.1,
+    offset < distance - 0.1,
+    true,
+  ))?;
+  cr.restore()?;
+  Ok(started.is_some())
+}
+
+fn row_title(
+  cr: &Context,
+  model: &Model,
+  title: &str,
+  rect: (i32, i32, i32),
+  row_top: i32,
+  row_height: i32,
+  weight: Weight,
+) -> cairo::Result<()> {
+  let hovered = inside(
+    model.bar_pointer,
+    MUSIC_LEFT - 4,
+    row_top,
+    PLAYER_X - MUSIC_LEFT,
+    row_height,
+  );
+  let started = hovered.then(|| {
+    let key = model.list_offset() + ((row_top - LIST_Y).max(0) as usize);
+    let start = model
+      .row_scroll
+      .get()
+      .filter(|(row, _)| *row == key)
+      .map_or_else(Instant::now, |(_, start)| start);
+    model.row_scroll.set(Some((key, start)));
+    start
+  });
+  if marquee(cr, title, rect, 14, weight, false, started)? {
+    model.row_animating.set(true);
+  }
+  Ok(())
+}
+
+fn player_title(cr: &Context, model: &Model) -> cairo::Result<()> {
+  let title = model
+    .starting_song
+    .as_ref()
+    .map_or(model.track.title.as_str(), |(song, _)| song.title.as_str());
+  let rect = if model.lyrics_view() {
+    (
+      MUSIC_LEFT + 72,
+      LYRICS_FOOTER_Y + 17,
+      PLAYER_X - MUSIC_LEFT - 86,
+    )
+  } else {
+    (PLAYER_X + 12, PANEL_Y + 222, PLAYER_WIDTH - 24)
+  };
+  let start = model.title_scroll.get().unwrap_or_else(Instant::now);
+  model.title_scroll.set(Some(start));
+  color(cr, 0xcdd6f4, 1.0);
+  model.title_animating.set(marquee(
+    cr,
+    if title.is_empty() {
+      "Nothing playing"
+    } else {
+      title
+    },
+    rect,
+    15,
+    Weight::Semibold,
+    !model.lyrics_view(),
+    Some(start),
+  )?);
+  Ok(())
+}
+
 fn search_symbol(cr: &Context, x: i32, y: i32) -> cairo::Result<()> {
   let (x, y) = (f64::from(x), f64::from(y));
   cr.set_line_width(1.45);
@@ -2130,6 +2308,32 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
     );
   }
 
+  if !model.playlist_busy
+    && inside(
+      model.bar_pointer,
+      PLAYER_SIGN_OUT_X,
+      SIGN_OUT_Y,
+      TAB_WIDTH,
+      MUSIC_TAB_HEIGHT,
+    )
+  {
+    round(
+      cr,
+      PLAYER_SIGN_OUT_X,
+      SIGN_OUT_Y,
+      TAB_WIDTH,
+      MUSIC_TAB_HEIGHT,
+      7.0,
+    );
+    color(cr, 0xcba6f7, 0.16);
+    cr.fill()?;
+  }
+  color(cr, 0xa6adc8, if model.playlist_busy { 0.5 } else { 1.0 });
+  sign_out_symbol(
+    cr,
+    f64::from(PLAYER_SIGN_OUT_X + TAB_WIDTH / 2),
+    f64::from(SIGN_OUT_Y + MUSIC_TAB_HEIGHT / 2),
+  )?;
   if model.lyrics_view() {
     return paint_lyrics(cr, model);
   }
@@ -2138,7 +2342,15 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
   } else {
     TAB_END
   };
-  let fade = model.count() > model.list_offset() + model.visible_list_rows();
+  let fade_top = model.list_offset() > 0;
+  let fade_bottom = model.count() > model.list_offset() + model.visible_list_rows();
+  let fade = fade_top || fade_bottom;
+  let top = if model.music_tab == MusicTab::Search {
+    RESULTS_Y
+  } else {
+    LIST_Y
+  };
+  model.row_animating.set(false);
   cr.save()?;
   cr.rectangle(
     f64::from(left - 4),
@@ -2183,14 +2395,15 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
         let cover = model.small_covers.get(&list.art).and_then(Option::as_ref);
         picture(cr, cover, left, y + 3, 30, "♪")?;
         color(cr, if selected { 0xcba6f7 } else { 0xcdd6f4 }, 1.0);
-        label(
+        row_title(
           cr,
+          model,
           &list.name,
           (left + 36, y + 9, width - 36),
-          14,
+          y,
+          PLAYLIST_ROW,
           Weight::Normal,
-          Alignment::Left,
-        );
+        )?;
       }
     }
     MusicTab::Queue => {
@@ -2219,14 +2432,15 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
         let cover = model.small_covers.get(&song.art).and_then(Option::as_ref);
         picture(cr, cover, left, y + 2, 26, "♪")?;
         color(cr, 0xcdd6f4, 1.0);
-        label(
+        row_title(
           cr,
+          model,
           &song.title,
           (left + 32, y + 7, width - 32),
-          14,
+          y,
+          QUEUE_ROW,
           Weight::Normal,
-          Alignment::Left,
-        );
+        )?;
       }
     }
     MusicTab::Lyrics => unreachable!(),
@@ -2322,20 +2536,20 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
         let cover = model.small_covers.get(&song.art).and_then(Option::as_ref);
         picture(cr, cover, left, y + 5, 32, "♪")?;
         color(cr, 0xcdd6f4, 1.0);
-        label_lines(
+        row_title(
           cr,
+          model,
           &song.title,
-          (left + 39, y, SAVE_X - left - 46),
-          13,
+          (left + 39, y + 4, SAVE_X - left - 46),
+          y,
+          RESULTS_ROW,
           Weight::Semibold,
-          Alignment::Left,
-          2,
-        );
+        )?;
         color(cr, 0xa6adc8, 1.0);
         label(
           cr,
           &song.artist,
-          (left + 39, y + 32, SAVE_X - left - 46),
+          (left + 39, y + 23, SAVE_X - left - 46),
           11,
           Weight::Normal,
           Alignment::Left,
@@ -2373,12 +2587,37 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
   }
   if fade {
     cr.pop_group_to_source()?;
-    let mask = cairo::LinearGradient::new(0.0, f64::from(bottom - 34), 0.0, f64::from(bottom));
-    mask.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 1.0);
-    mask.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.0);
-    cr.mask(&mask)?;
+    if top != LIST_Y {
+      cr.save()?;
+      cr.rectangle(
+        f64::from(left - 4),
+        f64::from(LIST_Y),
+        f64::from(PLAYER_X - left + 4),
+        f64::from(top - LIST_Y),
+      );
+      cr.clip();
+      cr.paint()?;
+      cr.restore()?;
+    }
+    cr.rectangle(
+      f64::from(left - 4),
+      f64::from(top),
+      f64::from(PLAYER_X - left + 4),
+      f64::from(bottom - top),
+    );
+    cr.clip();
+    cr.mask(&edge_mask(
+      f64::from(top),
+      f64::from(bottom),
+      fade_top,
+      fade_bottom,
+      false,
+    ))?;
   }
   cr.restore()?;
+  if !model.row_animating.get() {
+    model.row_scroll.set(None);
+  }
   if model.music_tab == MusicTab::Search && model.playlist_target.is_none() {
     if let Some(feedback) = model.add_feedback.as_deref().or_else(|| {
       model
@@ -2487,6 +2726,7 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
     f64::from(LYRICS_BOTTOM - LYRICS_TOP),
   );
   cr.clip();
+  cr.push_group();
   for (index, line) in model.lyrics.lines.iter().enumerate().skip(offset) {
     if y >= LYRICS_BOTTOM {
       break;
@@ -2553,6 +2793,14 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
     }
     y += height;
   }
+  cr.pop_group_to_source()?;
+  cr.mask(&edge_mask(
+    f64::from(LYRICS_TOP),
+    f64::from(LYRICS_BOTTOM),
+    true,
+    true,
+    false,
+  ))?;
   cr.restore()?;
   Ok(())
 }
@@ -2635,6 +2883,15 @@ fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo
     return Ok(());
   };
   let volume = model.volume(slider, Some(volume)).unwrap_or(volume);
+  color(cr, 0xa6adc8, 1.0);
+  label(
+    cr,
+    if send { "To mic" } else { "Listen" },
+    (PLAYER_X + 41, icon_y - 8, 54),
+    12,
+    Weight::Normal,
+    Alignment::Left,
+  );
   let width = MUSIC_GAIN_END - MUSIC_GAIN_START;
   color(cr, 0x45475a, 1.0);
   round(cr, MUSIC_GAIN_START, icon_y - 2, width, 4, 2.0);
@@ -2798,21 +3055,15 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       }
       return Ok(());
     }
-    let (title, artist) = model.starting_song.as_ref().map_or(
-      (model.track.title.as_str(), model.track.artist.as_str()),
-      |(song, _)| (song.title.as_str(), song.artist.as_str()),
-    );
+    let artist = model
+      .starting_song
+      .as_ref()
+      .map_or(model.track.artist.as_str(), |(song, _)| {
+        song.artist.as_str()
+      });
     if model.lyrics_view() {
       paint_music_library(cr, model, MUSIC_LEFT)?;
-      let y = LYRICS_BOTTOM + 33;
-      color(cr, 0xcdd6f4, 0.13);
-      cr.rectangle(
-        f64::from(MUSIC_LEFT),
-        f64::from(y - 9),
-        f64::from(WIDTH - 2 * MUSIC_LEFT),
-        1.0,
-      );
-      cr.fill()?;
+      let y = LYRICS_FOOTER_Y;
       picture(
         cr,
         model
@@ -2825,25 +3076,12 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
         58,
         "♪",
       )?;
-      color(cr, 0xcdd6f4, 1.0);
-      label_lines(
-        cr,
-        if title.is_empty() {
-          "Nothing playing"
-        } else {
-          title
-        },
-        (MUSIC_LEFT + 72, y + 8, PLAYER_X - MUSIC_LEFT - 86),
-        15,
-        Weight::Semibold,
-        Alignment::Left,
-        2,
-      );
+      player_title(cr, model)?;
       color(cr, 0xa6adc8, 1.0);
       label(
         cr,
         model.music_status().unwrap_or(artist),
-        (MUSIC_LEFT + 72, y + 49, PLAYER_X - MUSIC_LEFT - 86),
+        (MUSIC_LEFT + 72, y + 40, PLAYER_X - MUSIC_LEFT - 86),
         12,
         Weight::Normal,
         Alignment::Left,
@@ -2869,29 +3107,16 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
         .filter(|(url, _)| url == model.cover_url())
         .and_then(|(_, cover)| cover.as_ref()),
       PLAYER_X + (PLAYER_WIDTH - COVER) / 2,
-      PANEL_Y + 23,
+      PANEL_Y + 55,
       COVER,
       "♪",
     )?;
-    color(cr, 0xcdd6f4, 1.0);
-    label_lines(
-      cr,
-      if title.is_empty() {
-        "Nothing playing"
-      } else {
-        title
-      },
-      (PLAYER_X + 12, PANEL_Y + 212, PLAYER_WIDTH - 24),
-      15,
-      Weight::Semibold,
-      Alignment::Center,
-      2,
-    );
+    player_title(cr, model)?;
     color(cr, 0xa6adc8, 1.0);
     label(
       cr,
       artist,
-      (PLAYER_X + 12, PANEL_Y + 247, PLAYER_WIDTH - 24),
+      (PLAYER_X + 12, PANEL_Y + 246, PLAYER_WIDTH - 24),
       12,
       Weight::Normal,
       Alignment::Center,
@@ -2919,18 +3144,6 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
     cr.translate(0.0, f64::from(PANEL_Y + TRANSPORT_Y - 5));
     transport(cr, model)?;
     cr.restore()?;
-    let y = PANEL_Y + 6;
-    if !model.playlist_busy && inside(model.bar_pointer, PLAYER_SIGN_OUT_X, y, TAB_WIDTH, 27) {
-      round(cr, PLAYER_SIGN_OUT_X, y, TAB_WIDTH, 27, 6.0);
-      color(cr, 0xcba6f7, 0.20);
-      cr.fill()?;
-    }
-    color(cr, 0xa6adc8, if model.playlist_busy { 0.5 } else { 1.0 });
-    sign_out_symbol(
-      cr,
-      f64::from(PLAYER_SIGN_OUT_X + TAB_WIDTH / 2),
-      f64::from(y + 13),
-    )?;
     return Ok(());
   }
 
@@ -3454,6 +3667,8 @@ pub enum BarRegion {
   Timeline,
   Lyrics,
   Search,
+  MusicTitle,
+  MusicList,
 }
 
 impl BarRegion {
@@ -3471,7 +3686,20 @@ impl BarRegion {
         MUSIC_LEFT,
         LIST_Y - 10,
         WIDTH - 2 * MUSIC_LEFT,
-        LYRICS_BOTTOM + 24 - (LIST_Y - 10),
+        LYRICS_BOTTOM - (LIST_Y - 10),
+      ),
+      Self::MusicTitle if model.lyrics_view() => (
+        MUSIC_LEFT + 72,
+        LYRICS_FOOTER_Y + 17,
+        PLAYER_X - MUSIC_LEFT - 86,
+        23,
+      ),
+      Self::MusicTitle => (PLAYER_X + 12, PANEL_Y + 222, PLAYER_WIDTH - 24, 24),
+      Self::MusicList => (
+        MUSIC_LEFT - 4,
+        LIST_Y,
+        PLAYER_X - MUSIC_LEFT + 4,
+        TAB_END - LIST_Y,
       ),
       Self::Search => (left - 3, LIST_Y, PLAYER_X - left - 5, 30),
     }
@@ -3493,6 +3721,8 @@ impl BarRegion {
     match self {
       Self::Timeline => paint_timeline(cr, model),
       Self::Lyrics => paint_lyrics(cr, model),
+      Self::MusicTitle => player_title(cr, model),
+      Self::MusicList => paint_music_library(cr, model, MUSIC_LEFT),
       Self::Search => {
         let left = MUSIC_LEFT;
         paint_search_field(cr, model, left, PLAYER_X - left - 8)
