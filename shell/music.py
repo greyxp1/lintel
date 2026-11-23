@@ -415,17 +415,23 @@ def lrclib_lyrics(title, artist, duration):
         matches = json.loads(response.read(1_000_000))
     wanted = artist_names(artist)
     best = None
+    instrumental = False
     for item in matches:
         if normalized(recording_title(item.get("trackName") or "")) != normalized(title):
             continue
         common = wanted & artist_names(item.get("artistName") or "")
         drift = abs((item.get("duration") or 0) - duration)
-        if common and drift <= 3 and (lines := lrc_lines(item.get("syncedLyrics") or "")):
+        if not common or drift > 3:
+            continue
+        instrumental |= common == wanted and item.get("instrumental") is True
+        if lines := lrc_lines(item.get("syncedLyrics") or ""):
             score = (-len(common), drift)
             if best is None or score < best[0]:
                 best = (score, lines)
     if best:
         return {"source": "LRCLIB", "lines": best[1]}
+    if instrumental:
+        return {"source": "LRCLIB", "instrumental": True, "lines": []}
 
 
 def netease_request(path, **params):
@@ -505,7 +511,7 @@ def word_lyrics(title, artist, duration):
     for provider in (netease_lyrics, kugou_lyrics, lrclib_lyrics):
         Thread(target=lookup, args=(provider,), daemon=True).start()
     deadline = time.monotonic() + 5
-    line_timed = None
+    best = None
     for _ in range(3):
         try:
             result = replies.get(timeout=max(0, deadline - time.monotonic()))
@@ -513,9 +519,9 @@ def word_lyrics(title, artist, duration):
             break
         if result and any(line.get("words") for line in result["lines"]):
             return result
-        if result:
-            line_timed = result
-    return line_timed
+        if result and (best is None or result["lines"]):
+            best = result
+    return best
 
 
 def song_lyrics(yt, args):
@@ -575,6 +581,9 @@ def read_cached_lyrics(path):
     try:
         age = time.time() - path.stat().st_mtime
         reply = json.loads(path.read_text())
+        # Retry older misses that did not recognize instrumental recordings.
+        if reply["result"] is None and not reply.get("instrumental_checked"):
+            return None
         if age < (30 * 86400 if reply["word_timed"] else 86400):
             return reply
     except (OSError, ValueError, KeyError, TypeError):
@@ -585,7 +594,7 @@ def read_cached_lyrics(path):
 def keep_lyrics(path, result):
     try:
         word_timed = any(line.get("words") for line in (result or {}).get("lines", []))
-        save_json(path, {"word_timed": word_timed, "result": result})
+        save_json(path, {"word_timed": word_timed, "result": result, "instrumental_checked": True})
         files = [entry for entry in LYRIC_CACHE.iterdir() if entry.is_file()]
         if len(files) > 128:
             for entry in sorted(files, key=lambda item: item.stat().st_mtime)[:-128]:
@@ -630,6 +639,7 @@ def main():
                 print(json.dumps(playlists, ensure_ascii=False))
         else:
             lyric_path = None
+            timed = None
             if args.command == "lyrics" and args.title and args.artist and args.duration > 0:
                 lyric_path = lyric_cache_path(args.video_id)
                 cached = read_cached_lyrics(lyric_path)
@@ -637,7 +647,7 @@ def main():
                     print(json.dumps(cached["result"], ensure_ascii=False))
                     return 0
                 timed = word_lyrics(args.title, args.artist, args.duration)
-                if timed:
+                if timed and timed["lines"]:
                     keep_lyrics(lyric_path, timed)
                     print(json.dumps(timed, ensure_ascii=False))
                     return 0
@@ -656,6 +666,8 @@ def main():
                     return 0
                 client = connect_library()
                 result = handle(client, args)
+                if args.command == "lyrics" and not result:
+                    result = timed
                 if args.command == "library":
                     cache_library(result)
                 if SESSION.is_file():

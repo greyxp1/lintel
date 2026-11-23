@@ -1345,6 +1345,9 @@ fn fetch_lyrics(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
           state.lyrics_status = None;
           state.lyrics = lyrics;
         }
+        Ok(Some(lyrics)) if lyrics.instrumental => {
+          state.lyrics_status = Some("Instrumental".into());
+        }
         Ok(_) => state.lyrics_status = Some("No lyrics available".into()),
         Err(_) => {
           state.lyrics_id.clear();

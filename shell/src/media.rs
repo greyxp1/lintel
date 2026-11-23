@@ -882,6 +882,8 @@ pub fn search(query: &str) -> MediaResult<Vec<Song>> {
 
 #[derive(Default, Deserialize)]
 pub struct Lyrics {
+  #[serde(default)]
+  pub instrumental: bool,
   pub lines: Vec<LyricLine>,
 }
 
