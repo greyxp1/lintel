@@ -963,6 +963,32 @@ pub fn move_queue(socket: &Path, expected: Vec<String>, from: usize, to: usize) 
   })
 }
 
+pub fn artwork_accent(art: &Art) -> Option<u32> {
+  let mut sums = [0_u64; 3];
+  let mut weight_sum = 0_u64;
+  for px in art.data.chunks_exact(4).step_by(11) {
+    let [blue, green, red, alpha] = [px[0], px[1], px[2], px[3]];
+    let peak = red.max(green).max(blue);
+    let chroma = peak - red.min(green).min(blue);
+    if alpha < 220 || chroma < 24 || peak < 64 {
+      continue;
+    }
+    let weight = u64::from(chroma).pow(2);
+    for (sum, channel) in sums.iter_mut().zip([red, green, blue]) {
+      *sum += u64::from(channel) * weight;
+    }
+    weight_sum += weight;
+  }
+  if weight_sum == 0 {
+    return None;
+  }
+  let channels = sums.map(|sum| sum / weight_sum);
+  let peak = channels[0].max(channels[1]).max(channels[2]);
+  Some(channels.into_iter().fold(0_u32, |rgb, channel| {
+    (rgb << 8) | (144 + channel * 101 / peak) as u32
+  }))
+}
+
 pub fn artwork(url: &str, size: u32) -> Option<Art> {
   let mut url = url.to_owned();
   let host = url.strip_prefix("https://")?.split('/').next()?;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cairo::{Context, Format, ImageSurface, Operator};
-use gio::glib::DateTime;
+use gio::glib::{self, DateTime};
 use pango::{Alignment, EllipsizeMode, FontDescription, SCALE, Weight};
 
 use crate::audio::{Device, MusicChannel, Stream, StreamId, Volume};
@@ -27,8 +27,8 @@ const BUTTON_WIDTH: i32 = 40;
 const PLAYER_X: i32 = MUSIC_PANEL_X + 340;
 const PLAYER_WIDTH: i32 = MUSIC_PANEL_WIDTH - 340;
 const TRANSPORT_X: i32 = PLAYER_X + (PLAYER_WIDTH - 3 * BUTTON_WIDTH) / 2;
-const SEEK_Y: i32 = 294;
-const TRANSPORT_Y: i32 = 313;
+const SEEK_Y: i32 = 288;
+const TRANSPORT_Y: i32 = 309;
 const TAB_Y: i32 = PANEL_Y + 17;
 const TAB_START: i32 = MUSIC_LEFT - 4;
 const TAB_WIDTH: i32 = 28;
@@ -37,15 +37,19 @@ const MUSIC_TAB_HEIGHT: i32 = 32;
 const SAVE_WIDTH: i32 = 55;
 const SAVE_X: i32 = PLAYER_X - SAVE_WIDTH - 12;
 const LIST_Y: i32 = PANEL_Y + 60;
-const MUSIC_BOTTOM: i32 = TRANSPORT_END + 24;
+const MUSIC_BOTTOM: i32 = TRANSPORT_END + 17;
 const TAB_END: i32 = MUSIC_BOTTOM - 3;
 const SEARCH_END: i32 = TAB_END - 22;
-const MUSIC_GAIN_TOP: i32 = PANEL_Y + 92;
-const MUSIC_GAIN_BOTTOM: i32 = PANEL_Y + 197;
+const COVER_Y: i32 = PANEL_Y + 23;
+const MUSIC_GAIN_TOP: i32 = COVER_Y;
+const MUSIC_GAIN_BOTTOM: i32 = COVER_Y + COVER - 40;
+const MUSIC_GAIN_ICON_Y: i32 = COVER_Y + COVER - 10;
 const LYRICS_SHIFT: i32 = 174;
 const LYRICS_LEFT: i32 = MUSIC_LEFT + 12;
 const LYRICS_WIDTH: i32 = WIDTH - 2 * LYRICS_LEFT;
-const LYRICS_TOP: i32 = LIST_Y + 20;
+const FOLLOW_WIDTH: i32 = 76;
+const FOLLOW_X: i32 = WIDTH - MUSIC_LEFT - FOLLOW_WIDTH;
+const LYRICS_TOP: i32 = TAB_Y + MUSIC_TAB_HEIGHT + 4;
 const LYRICS_BOTTOM: i32 = 473;
 const LYRICS_FOOTER_Y: i32 = 480;
 const RESULTS_Y: i32 = LIST_Y + 41;
@@ -449,6 +453,7 @@ pub struct Model {
   pub mic_revision: u64,
   pub audio_error: Option<String>,
   pub large_cover: Option<(String, Option<ImageSurface>)>,
+  pub cover_accent: Option<u32>,
   offset: usize,
 }
 
@@ -1002,6 +1007,15 @@ impl Model {
     }
   }
 
+  fn music_accent(&self) -> u32 {
+    self
+      .large_cover
+      .as_ref()
+      .filter(|(url, _)| url == self.cover_url())
+      .and(self.cover_accent)
+      .unwrap_or(0xcba6f7)
+  }
+
   pub fn cover_url(&self) -> &str {
     self
       .starting_song
@@ -1466,8 +1480,14 @@ impl Model {
       }
       if self.lyrics_view() {
         if self.lyrics_scrolled
-          && (WIDTH - LYRICS_LEFT - 76..WIDTH - LYRICS_LEFT).contains(&x)
-          && (LIST_Y - 10..LYRICS_TOP).contains(&y)
+          && self.lyric_marker().is_some()
+          && inside(
+            Some((x.into(), y.into())),
+            FOLLOW_X,
+            TAB_Y,
+            FOLLOW_WIDTH,
+            MUSIC_TAB_HEIGHT,
+          )
         {
           self.lyrics_scrolled = false;
         } else if self.track.duration > 0.0
@@ -1663,7 +1683,7 @@ fn music_gain_icon_hit(pointer: Option<(f64, f64)>, channel: MusicChannel) -> bo
   inside(
     pointer,
     music_gain_x(channel) - 13,
-    MUSIC_GAIN_TOP - 30,
+    MUSIC_GAIN_ICON_Y - 13,
     26,
     26,
   )
@@ -1996,7 +2016,7 @@ fn paint_timeline(cr: &Context, model: &Model) -> cairo::Result<()> {
     let filled = (f64::from(width) * (position / duration).clamp(0.0, 1.0)).round() as i32;
     if filled > 0 {
       let hovered = inside(model.bar_pointer, x, y - 4, width, 12);
-      color(cr, if hovered { 0xf5c2e7 } else { 0xcba6f7 }, 1.0);
+      color(cr, model.music_accent(), if hovered { 1.0 } else { 0.85 });
       round(cr, x, y, filled, 4, 2.0_f64.min(f64::from(filled) / 2.0));
       cr.fill()?;
     }
@@ -2018,7 +2038,7 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
       )
     {
       round(cr, x + 2, 6, BUTTON_WIDTH - 4, 28, 6.0);
-      color(cr, 0xcba6f7, 0.20);
+      color(cr, model.music_accent(), 0.20);
       cr.fill()?;
     }
   }
@@ -2084,11 +2104,11 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
     )
   {
     round(cr, PLAYER_SIGN_OUT_X, 5, TAB_WIDTH, 27, 6.0);
-    color(cr, 0xcba6f7, 0.16);
+    color(cr, model.music_accent(), 0.16);
     cr.fill()?;
   }
   color(cr, 0xa6adc8, if model.playlist_busy { 0.5 } else { 1.0 });
-  sign_out_symbol(cr, f64::from(PLAYER_SIGN_OUT_X + TAB_WIDTH / 2), 18.0)?;
+  sign_out_symbol(cr, f64::from(PLAYER_SIGN_OUT_X + TAB_WIDTH / 2), 20.0)?;
 
   Ok(())
 }
@@ -2228,7 +2248,7 @@ fn player_title(cr: &Context, model: &Model) -> cairo::Result<()> {
       PLAYER_X - MUSIC_LEFT - 86,
     )
   } else {
-    (PLAYER_X + 12, PANEL_Y + 222, PLAYER_WIDTH - 24)
+    (PLAYER_X + 12, PANEL_Y + 219, PLAYER_WIDTH - 24)
   };
   let start = model.title_scroll.get().unwrap_or_else(Instant::now);
   model.title_scroll.set(Some(start));
@@ -2318,10 +2338,18 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
     );
     if selected || hovered {
       round(cr, x + 1, TAB_Y, MUSIC_TAB_WIDTH - 3, MUSIC_TAB_HEIGHT, 7.0);
-      color(cr, 0xcba6f7, if hovered { 0.25 } else { 0.16 });
+      color(cr, model.music_accent(), if hovered { 0.25 } else { 0.16 });
       cr.fill()?;
     }
-    color(cr, if selected { 0xcba6f7 } else { 0xcdd6f4 }, 1.0);
+    color(
+      cr,
+      if selected {
+        model.music_accent()
+      } else {
+        0xcdd6f4
+      },
+      1.0,
+    );
     label(
       cr,
       name,
@@ -2333,6 +2361,27 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
   }
 
   if model.lyrics_view() {
+    if model.lyrics_scrolled && model.lyric_marker().is_some() {
+      let hovered = inside(
+        model.bar_pointer,
+        FOLLOW_X,
+        TAB_Y,
+        FOLLOW_WIDTH,
+        MUSIC_TAB_HEIGHT,
+      );
+      round(cr, FOLLOW_X, TAB_Y, FOLLOW_WIDTH, MUSIC_TAB_HEIGHT, 7.0);
+      color(cr, model.music_accent(), if hovered { 0.24 } else { 0.13 });
+      cr.fill()?;
+      color(cr, model.music_accent(), 1.0);
+      label(
+        cr,
+        "Follow",
+        (FOLLOW_X, TAB_Y + 7, FOLLOW_WIDTH),
+        13,
+        Weight::Semibold,
+        Alignment::Center,
+      );
+    }
     return paint_lyrics(cr, model);
   }
   let bottom = if model.music_tab == MusicTab::Search {
@@ -2387,12 +2436,20 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
         let hovered = inside(model.bar_pointer, left - 4, y, width + 4, PLAYLIST_ROW - 3);
         if selected || hovered {
           round(cr, left - 4, y, width + 4, PLAYLIST_ROW - 3, 7.0);
-          color(cr, 0xcba6f7, if hovered { 0.23 } else { 0.16 });
+          color(cr, model.music_accent(), if hovered { 0.23 } else { 0.16 });
           cr.fill()?;
         }
         let cover = model.small_covers.get(&list.art).and_then(Option::as_ref);
         picture(cr, cover, left, y + 3, 30, "♪")?;
-        color(cr, if selected { 0xcba6f7 } else { 0xcdd6f4 }, 1.0);
+        color(
+          cr,
+          if selected {
+            model.music_accent()
+          } else {
+            0xcdd6f4
+          },
+          1.0,
+        );
         row_title(
           cr,
           model,
@@ -2424,7 +2481,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
           .is_some_and(|drag| drag.from == index);
         if dragged || inside(model.bar_pointer, left - 4, y, width + 4, QUEUE_ROW - 2) {
           round(cr, left - 4, y, width + 4, QUEUE_ROW - 2, 6.0);
-          color(cr, 0xcba6f7, if dragged { 0.29 } else { 0.17 });
+          color(cr, model.music_accent(), if dragged { 0.29 } else { 0.17 });
           cr.fill()?;
         }
         let cover = model.small_covers.get(&song.art).and_then(Option::as_ref);
@@ -2445,7 +2502,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
     MusicTab::Search if let Some(target) = &model.playlist_target => {
       let hovered = inside(model.bar_pointer, left - 4, LIST_Y, width + 4, 32);
       round(cr, left - 4, LIST_Y, width + 4, 32, 7.0);
-      color(cr, 0xcba6f7, if hovered { 0.23 } else { 0.14 });
+      color(cr, model.music_accent(), if hovered { 0.23 } else { 0.14 });
       cr.fill()?;
       color(cr, 0xcdd6f4, 1.0);
       label(
@@ -2476,7 +2533,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
           || inside(model.bar_pointer, left - 4, y, width + 4, RESULTS_ROW - 2)
         {
           round(cr, left - 4, y, width + 4, RESULTS_ROW - 2, 6.0);
-          color(cr, 0xcba6f7, 0.17);
+          color(cr, model.music_accent(), 0.17);
           cr.fill()?;
         }
         picture(
@@ -2528,7 +2585,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
           || inside(model.bar_pointer, left - 4, y, width + 4, RESULTS_ROW - 2)
         {
           round(cr, left - 4, y, width + 4, RESULTS_ROW - 2, 6.0);
-          color(cr, 0xcba6f7, 0.17);
+          color(cr, model.music_accent(), 0.17);
           cr.fill()?;
         }
         let cover = model.small_covers.get(&song.art).and_then(Option::as_ref);
@@ -2560,7 +2617,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
         } else {
           0.13
         };
-        color(cr, 0xcba6f7, alpha);
+        color(cr, model.music_accent(), alpha);
         round(cr, SAVE_X, y + 6, SAVE_WIDTH, 30, 7.0);
         cr.fill()?;
         color(
@@ -2568,7 +2625,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
           if model.adding_song {
             0xa6adc8
           } else {
-            0xcba6f7
+            model.music_accent()
           },
           1.0,
         );
@@ -2622,7 +2679,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
         .search_row
         .map(|_| "↑↓ Select   Enter Play   Ctrl+Enter Add")
     }) {
-      color(cr, 0xcba6f7, 1.0);
+      color(cr, model.music_accent(), 1.0);
       label(
         cr,
         feedback,
@@ -2676,46 +2733,28 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
   let current = marker.map(|marker| marker.index);
   let follow = current.is_some() && !model.lyrics_scrolled;
   let (offset, mut y) = if let Some(marker) = marker.filter(|_| follow) {
-    let anchor = LYRICS_TOP + 81;
-    if marker.index == 0 {
-      (0, anchor)
-    } else {
-      let height = |index: usize| {
-        lyric_layout(cr, &model.lyrics.lines[index].text)
-          .pixel_size()
-          .1
-          + 20
-      };
-      let previous = marker.index - 1;
-      let previous_height = height(previous);
+    let anchor = LYRICS_TOP + (LYRICS_BOTTOM - LYRICS_TOP) * 3 / 10;
+    let height = |index: usize| {
+      lyric_layout(cr, &model.lyrics.lines[index].text)
+        .pixel_size()
+        .1
+        + 20
+    };
+    let mut offset = marker.index;
+    let mut y = f64::from(anchor);
+    if offset > 0 {
       let t = f64::from(marker.scroll_progress) / 1024.0;
       let remaining = 1.0 - t * t * (3.0 - 2.0 * t);
-      let y = anchor - previous_height + (remaining * f64::from(previous_height)).round() as i32;
-      if previous > 0 && marker.scroll_progress < 1024 {
-        (previous - 1, y - height(previous - 1))
-      } else {
-        (previous, y)
-      }
+      y += remaining * f64::from(height(offset - 1));
     }
+    while offset > 0 && y > f64::from(LYRICS_TOP) {
+      offset -= 1;
+      y -= f64::from(height(offset));
+    }
+    (offset, y)
   } else {
-    (model.offset, LYRICS_TOP)
+    (model.offset, f64::from(LYRICS_TOP))
   };
-  if current.is_some() && !follow {
-    let x = WIDTH - LYRICS_LEFT - 76;
-    let hovered = inside(model.bar_pointer, x, LIST_Y - 10, 76, 28);
-    round(cr, x, LIST_Y - 10, 76, 28, 7.0);
-    color(cr, 0xcba6f7, if hovered { 0.24 } else { 0.13 });
-    cr.fill()?;
-    color(cr, 0xcba6f7, 1.0);
-    label(
-      cr,
-      "Follow",
-      (x, LIST_Y - 5, 76),
-      13,
-      Weight::Semibold,
-      Alignment::Center,
-    );
-  }
   cr.save()?;
   cr.rectangle(
     f64::from(LYRICS_LEFT),
@@ -2725,50 +2764,55 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
   );
   cr.clip();
   cr.push_group();
+  let fade_top = y < f64::from(LYRICS_TOP);
   for (index, line) in model.lyrics.lines.iter().enumerate().skip(offset) {
-    if y >= LYRICS_BOTTOM {
+    if y >= f64::from(LYRICS_BOTTOM) {
       break;
     }
-    let active = marker.filter(|marker| marker.index == index && marker.singing);
+    let active = marker.filter(|marker| marker.index == index);
     let layout = lyric_layout(cr, &line.text);
-    let attrs = active.filter(|marker| marker.word_end > 0).map(|marker| {
-      let end = marker.word_end;
-      let progress = marker.word_progress;
-      let attrs = pango::AttrList::new();
-      let previous = line
-        .words
-        .iter()
-        .take_while(|word| word.end_byte < end)
-        .last()
-        .map_or(0, |word| word.end_byte);
-      let mut sung = pango::AttrColor::new_foreground(0xffff, 0xf9f9, 0xf8f8);
-      sung.set_end_index(previous);
-      attrs.insert(sung);
-      let tint =
-        |from: u16, to: u16| from + ((u32::from(to - from) * u32::from(progress)) / 16) as u16;
-      let mut word = pango::AttrColor::new_foreground(
-        tint(0xacac, 0xffff),
-        tint(0xaaaa, 0xf9f9),
-        tint(0xc0c0, 0xf8f8),
-      );
-      word.set_start_index(previous);
-      word.set_end_index(end);
-      attrs.insert(word);
-      attrs
-    });
+    let attrs = active
+      .filter(|marker| marker.singing && marker.word_end > 0)
+      .map(|marker| {
+        let end = marker.word_end;
+        let progress = marker.word_progress;
+        let attrs = pango::AttrList::new();
+        let previous = line
+          .words
+          .iter()
+          .take_while(|word| word.end_byte < end)
+          .last()
+          .map_or(0, |word| word.end_byte);
+        let mut sung = pango::AttrColor::new_foreground(0xffff, 0xf9f9, 0xf8f8);
+        sung.set_end_index(previous);
+        attrs.insert(sung);
+        let tint =
+          |from: u16, to: u16| from + ((u32::from(to - from) * u32::from(progress)) / 16) as u16;
+        let mut word = pango::AttrColor::new_foreground(
+          tint(0xacac, 0xffff),
+          tint(0xaaaa, 0xf9f9),
+          tint(0xc0c0, 0xf8f8),
+        );
+        word.set_start_index(previous);
+        word.set_end_index(end);
+        attrs.insert(word);
+        attrs
+      });
     layout.set_attributes(attrs.as_ref());
     let height = layout.pixel_size().1 + 20;
+    let top = y.floor() as i32;
+    let bottom = (y + f64::from(height)).ceil() as i32;
     let hovered = current.is_some()
       && inside(
         model.bar_pointer,
         LYRICS_LEFT,
-        y.max(LYRICS_TOP),
+        top.max(LYRICS_TOP),
         LYRICS_WIDTH,
-        (y + height).min(LYRICS_BOTTOM) - y.max(LYRICS_TOP),
+        bottom.min(LYRICS_BOTTOM) - top.max(LYRICS_TOP),
       );
     let (ink, alpha) = if active.is_some() {
       (
-        if line.words.is_empty() {
+        if line.words.is_empty() || active.is_some_and(|marker| !marker.singing) {
           0xfff9f8
         } else {
           0xacaac0
@@ -2782,21 +2826,21 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
       (0xcdd6f4, 0.68 - distance * 0.044)
     };
     color(cr, ink, alpha);
-    cr.move_to(f64::from(LYRICS_LEFT), f64::from(y));
+    cr.move_to(f64::from(LYRICS_LEFT), y);
     pangocairo::functions::show_layout(cr, &layout);
     if let Some(start) = line.start
-      && y + height > LYRICS_TOP
+      && bottom > LYRICS_TOP
     {
-      hits.push((y.max(LYRICS_TOP), (y + height).min(LYRICS_BOTTOM), start));
+      hits.push((top.max(LYRICS_TOP), bottom.min(LYRICS_BOTTOM), start));
     }
-    y += height;
+    y += f64::from(height);
   }
   cr.pop_group_to_source()?;
   cr.mask(&edge_mask(
     f64::from(LYRICS_TOP),
     f64::from(LYRICS_BOTTOM),
-    true,
-    true,
+    fade_top,
+    y >= f64::from(LYRICS_BOTTOM),
     false,
   ))?;
   cr.restore()?;
@@ -2838,7 +2882,7 @@ fn paint_audio_device(cr: &Context, x: f64, y: f64, device: Device) -> cairo::Re
 
 fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo::Result<()> {
   let x = music_gain_x(channel);
-  let icon_y = MUSIC_GAIN_TOP - 17;
+  let icon_y = MUSIC_GAIN_ICON_Y;
   let level = model.music_slider(channel);
   if level.is_none() && (channel == MusicChannel::Listen || !model.music_mix) {
     return Ok(());
@@ -2887,7 +2931,15 @@ fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo
   cr.fill()?;
   let filled = height * i32::from(volume.percent.min(100)) / 100;
   if filled > 0 {
-    color(cr, if volume.muted { 0x6c7086 } else { 0xcba6f7 }, 1.0);
+    color(
+      cr,
+      if volume.muted {
+        0x6c7086
+      } else {
+        model.music_accent()
+      },
+      1.0,
+    );
     round(
       cr,
       x - 2,
@@ -3096,7 +3148,7 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
         .filter(|(url, _)| url == model.cover_url())
         .and_then(|(_, cover)| cover.as_ref()),
       PLAYER_X + (PLAYER_WIDTH - COVER) / 2,
-      PANEL_Y + 23,
+      COVER_Y,
       COVER,
       "♪",
     )?;
@@ -3105,17 +3157,17 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
     label(
       cr,
       artist,
-      (PLAYER_X + 12, PANEL_Y + 246, PLAYER_WIDTH - 24),
+      (PLAYER_X + 12, PANEL_Y + 239, PLAYER_WIDTH - 24),
       12,
       Weight::Normal,
       Alignment::Center,
     );
     if let Some(status) = model.music_status() {
-      color(cr, 0xcba6f7, 1.0);
+      color(cr, model.music_accent(), 1.0);
       label(
         cr,
         status,
-        (PLAYER_X + 8, PANEL_Y + 259, PLAYER_WIDTH - 18),
+        (PLAYER_X + 8, PANEL_Y + 255, PLAYER_WIDTH - 18),
         11,
         Weight::Normal,
         Alignment::Center,
@@ -3673,9 +3725,9 @@ impl BarRegion {
       ),
       Self::Lyrics => (
         MUSIC_LEFT,
-        LIST_Y - 10,
+        LYRICS_TOP,
         WIDTH - 2 * MUSIC_LEFT,
-        LYRICS_BOTTOM - (LIST_Y - 10),
+        LYRICS_BOTTOM - LYRICS_TOP,
       ),
       Self::MusicTitle if model.lyrics_view() => (
         MUSIC_LEFT + 72,
@@ -3683,7 +3735,7 @@ impl BarRegion {
         PLAYER_X - MUSIC_LEFT - 86,
         23,
       ),
-      Self::MusicTitle => (PLAYER_X + 12, PANEL_Y + 222, PLAYER_WIDTH - 24, 24),
+      Self::MusicTitle => (PLAYER_X + 12, PANEL_Y + 219, PLAYER_WIDTH - 24, 24),
       Self::MusicList => (
         MUSIC_LEFT - 4,
         LIST_Y,
@@ -3833,13 +3885,21 @@ fn paint_bar_header(cr: &Context, model: &Model) -> cairo::Result<()> {
   color(
     cr,
     if model.panel == Panel::Music {
-      0xcba6f7
+      model.music_accent()
     } else {
       0xcdd6f4
     },
     1.0,
   );
   let music = f64::from(MUSIC_X + UTILITY_WIDTH / 2);
+  if model.bar_visible && model.track.playing {
+    let phase = (glib::monotonic_time() % 2_400_000) as f64 / 2_400_000.0;
+    let pulse = 0.5 - 0.5 * (phase * std::f64::consts::TAU).cos();
+    round(cr, MUSIC_X + 4, 5, UTILITY_WIDTH - 8, HEIGHT - 10, 8.0);
+    color(cr, model.music_accent(), 0.06 + 0.14 * pulse);
+    cr.fill()?;
+    color(cr, model.music_accent(), 1.0);
+  }
   cr.new_sub_path();
   cr.arc(music - 2.0, 24.0, 3.0, 0.0, std::f64::consts::TAU);
   cr.fill()?;

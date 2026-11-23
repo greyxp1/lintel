@@ -929,7 +929,8 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, Layer> for Desktop {
 }
 
 fn music_frame(model: &Model) -> bool {
-  model.lyric_scroll_animating()
+  (model.bar_visible && model.track.playing)
+    || model.lyric_scroll_animating()
     || model.music_marquee(ui::BarRegion::MusicTitle)
     || model.music_marquee(ui::BarRegion::MusicList)
 }
@@ -943,10 +944,11 @@ impl Dispatch<wl_callback::WlCallback, Layer> for Desktop {
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
-    let (animate, lyrics, title, list) = {
+    let (animate, header, lyrics, title, list) = {
       let model = state.model.borrow();
       (
         model.timed_popups(),
+        model.bar_visible && model.track.playing,
         model.lyric_scroll_animating(),
         model.music_marquee(ui::BarRegion::MusicTitle),
         model.music_marquee(ui::BarRegion::MusicList),
@@ -958,6 +960,7 @@ impl Dispatch<wl_callback::WlCallback, Layer> for Desktop {
       surface.frame = None;
       if *kind == Layer::Bar {
         for (active, region) in [
+          (header, ui::BarRegion::Header),
           (lyrics, ui::BarRegion::Lyrics),
           (title, ui::BarRegion::MusicTitle),
           (list, ui::BarRegion::MusicList),

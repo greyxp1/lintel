@@ -934,7 +934,7 @@ async fn watch_tracks(
     if lyrics {
       fetch_lyrics(&model, &refresh);
     }
-    if expanded && art_changed {
+    if art_changed {
       fetch_art(&model, &refresh);
     }
     if expanded && queue_changed {
@@ -1401,8 +1401,7 @@ fn search_music(query: String, model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()
 fn fetch_art(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   let mut state = model.borrow_mut();
   let url = state.cover_url();
-  if state.panel != Panel::Music
-    || !state.signed_in
+  if !state.signed_in
     || url.is_empty()
     || state
       .large_cover
@@ -1413,6 +1412,7 @@ fn fetch_art(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   }
   let url = url.to_owned();
   state.large_cover = Some((url.clone(), None));
+  state.cover_accent = None;
   drop(state);
   let model = model.clone();
   let refresh = refresh.clone();
@@ -1427,7 +1427,9 @@ fn fetch_art(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
         && *cached == url
         && cover.is_none()
       {
+        let accent = art.as_ref().and_then(media::artwork_accent);
         *cover = art.and_then(ui::image);
+        state.cover_accent = accent;
         drop(state);
         refresh();
       }
