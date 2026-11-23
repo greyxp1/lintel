@@ -453,7 +453,13 @@ fn run() -> Result<()> {
               redraw();
             }
             watch_music_clock(&model, &display_events);
-            watch_audio(&model, &redraw);
+            let load_gains = {
+              let state = model.borrow();
+              state.music_mix && state.music_levels.iter().any(Option::is_none)
+            };
+            if load_gains {
+              refresh_audio(&model, &redraw);
+            }
             fetch_art(&model, &redraw);
             fetch_small_covers(&model, &redraw);
             let lyrics = {
@@ -993,7 +999,7 @@ fn watch_audio(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   let model = model.clone();
   let refresh = refresh.clone();
   glib::timeout_add_local(Duration::from_secs(1), move || {
-    if !matches!(model.borrow().panel, Panel::Music | Panel::Audio) {
+    if model.borrow().panel != Panel::Audio {
       model.borrow_mut().audio_watching = false;
       return ControlFlow::Break;
     }
@@ -1128,11 +1134,9 @@ fn write_volume(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
 
 fn refresh_audio(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   let state = model.borrow();
-  let music_only = state.panel == Panel::Music;
   let music_mix = state.music_mix;
-  let split_music = music_only && music_mix;
   let player = state.track.player_pid;
-  if state.audio_setting || (music_only && (!state.signed_in || (!split_music && player == 0))) {
+  if state.audio_setting {
     return;
   }
   let revision = state.audio_revision;
@@ -1141,36 +1145,22 @@ fn refresh_audio(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   let refresh = refresh.clone();
   background(
     move || {
-      if split_music {
-        return (None, None, Some(audio::music_levels()));
-      }
-      let devices = (!music_only).then(|| {
-        (
-          audio::get(Device::Output).ok(),
-          audio::get(Device::Input).ok(),
-        )
-      });
       (
-        devices,
-        Some(audio::streams(player, music_only, music_mix)),
-        None,
+        audio::get(Device::Output).ok(),
+        audio::get(Device::Input).ok(),
+        audio::streams(player, music_mix),
+        music_mix.then(audio::music_levels),
       )
     },
-    move |(devices, streams, music)| {
+    move |(output, input, streams, music)| {
       let mut state = model.borrow_mut();
-      if state.audio_revision != revision
-        || (!split_music && state.track.player_pid != player)
-        || (state.panel == Panel::Music) != music_only
-      {
+      if state.audio_revision != revision || state.track.player_pid != player {
         return;
       }
-      let changed = devices.is_some_and(|(output, input)| {
-        let changed = state.output != output || state.input != input;
-        state.output = output;
-        state.input = input;
-        changed
-      });
-      let streams_changed = streams.is_some_and(|streams| state.set_streams(streams, music_only));
+      let changed = state.output != output || state.input != input;
+      state.output = output;
+      state.input = input;
+      let streams_changed = state.set_streams(streams);
       let music_changed = music.is_some_and(|levels| {
         let changed = state.music_levels != levels;
         state.music_levels = levels;

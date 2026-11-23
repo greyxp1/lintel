@@ -68,7 +68,7 @@ pub struct Stream {
   pub music: bool,
 }
 
-pub fn streams(player: u32, music_only: bool, split_music: bool) -> Vec<Stream> {
+pub fn streams(player: u32, split_music: bool) -> Vec<Stream> {
   let music_inputs = if split_music {
     music_stream_ids().unwrap_or_default()
   } else {
@@ -76,9 +76,6 @@ pub fn streams(player: u32, music_only: bool, split_music: bool) -> Vec<Stream> 
   };
   let mut streams: Vec<Stream> = Vec::new();
   for (kind, recording) in [("sink-inputs", false), ("source-outputs", true)] {
-    if music_only && (recording || player == 0) {
-      break;
-    }
     let Ok(output) = Command::new("pactl")
       .args(["--format=json", "list", kind])
       .output()
@@ -98,9 +95,6 @@ pub fn streams(player: u32, music_only: bool, split_music: bool) -> Vec<Stream> 
               .as_str()
               .and_then(|pid| pid.parse().ok())
               == Some(player)));
-      if music_only && !music {
-        return None;
-      }
       if properties["application.id"].as_str() == Some("lintel-mic-monitor")
         || properties["node.passive"].as_str() == Some("true")
         || (item["client"].is_null() && properties["media.role"].as_str() == Some("production"))
