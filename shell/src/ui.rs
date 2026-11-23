@@ -8,7 +8,7 @@ use gio::glib::DateTime;
 use pango::{Alignment, EllipsizeMode, FontDescription, SCALE, Weight};
 
 use crate::audio::{Device, MusicChannel, Stream, StreamId, Volume};
-use crate::media::{Art, Bookmark, Lyrics, Playlist, QueueSong, Song, Track};
+use crate::media::{Art, Bookmark, LyricLine, Lyrics, Playlist, QueueSong, Song, Track};
 
 const HEADER_WIDTH: i32 = 408;
 pub const WIDTH: i32 = 644;
@@ -51,6 +51,9 @@ const FOLLOW_X: i32 = WIDTH - MUSIC_LEFT - FOLLOW_WIDTH;
 const LYRICS_TOP: i32 = TAB_Y + MUSIC_TAB_HEIGHT + 4;
 const LYRICS_BOTTOM: i32 = 473;
 const LYRICS_FOOTER_Y: i32 = 480;
+const INSTRUMENTAL_BREAK: f64 = 5.0;
+const LRC_LINE_DURATION: f64 = 4.0;
+const LYRICS_BREAK_HEIGHT: i32 = 48;
 const RESULTS_Y: i32 = LIST_Y + 41;
 const RESULTS_ROW: i32 = 46;
 const SEARCH_ROWS: usize = ((SEARCH_END - RESULTS_Y) / RESULTS_ROW) as usize;
@@ -201,11 +204,69 @@ const MUSIC_TABS: [MusicTab; 4] = [
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct LyricMarker {
-  index: usize,
+  row: usize,
   word_end: u32,
   word_progress: u8,
+  break_progress: u8,
   scroll_progress: u16,
   singing: bool,
+}
+
+#[derive(Clone, Copy)]
+enum LyricRow {
+  Break { start: f64, end: f64 },
+  Line(usize),
+}
+
+impl LyricRow {
+  fn start(self, lines: &[LyricLine]) -> Option<f64> {
+    match self {
+      Self::Break { start, .. } => Some(start),
+      Self::Line(index) => lines.get(index).and_then(|line| line.start),
+    }
+  }
+}
+
+fn lyric_sung_end(line: &LyricLine) -> Option<f64> {
+  line
+    .end
+    .or_else(|| line.words.last().map(|word| word.end.unwrap_or(word.start)))
+}
+
+fn instrumental_break_before(lines: &[LyricLine], index: usize) -> Option<(f64, f64)> {
+  let start = lines.get(index)?.start?;
+  if index == 0 {
+    return (start >= INSTRUMENTAL_BREAK).then_some((0.0, start));
+  }
+  let previous = &lines[index - 1];
+  if let Some(end) = lyric_sung_end(previous) {
+    return (start - end >= INSTRUMENTAL_BREAK).then_some((end, start));
+  }
+  let previous_start = previous.start?;
+  let break_start = previous_start + LRC_LINE_DURATION;
+  (start - break_start >= INSTRUMENTAL_BREAK).then_some((break_start, start))
+}
+
+fn lyric_rows(lines: &[LyricLine]) -> Vec<LyricRow> {
+  let synced = lines.first().and_then(|line| line.start).is_some();
+  let mut rows = Vec::with_capacity(lines.len());
+  for index in 0..lines.len() {
+    if synced && let Some((start, end)) = instrumental_break_before(lines, index) {
+      rows.push(LyricRow::Break { start, end });
+    }
+    rows.push(LyricRow::Line(index));
+  }
+  rows
+}
+
+fn lyric_row_count(lines: &[LyricLine]) -> usize {
+  if lines.first().and_then(|line| line.start).is_none() {
+    return lines.len();
+  }
+  lines.len()
+    + (0..lines.len())
+      .filter(|&index| instrumental_break_before(lines, index).is_some())
+      .count()
 }
 
 struct PlaylistTarget {
@@ -568,9 +629,37 @@ impl Model {
     }
     let elapsed = self.playback_position();
     let lines = &self.lyrics.lines;
+    let rows = lyric_rows(lines);
+    let scroll_for = |start: Option<f64>| {
+      if !self.lyrics_scrolled && self.track.progressing_since.is_some() {
+        start.map_or(1024, |start| {
+          (((elapsed - start) / 0.28) * 1024.0).clamp(0.0, 1024.0) as u16
+        })
+      } else {
+        1024
+      }
+    };
+    if let Some((row, start, end)) = rows.iter().enumerate().find_map(|(row, item)| match *item {
+      LyricRow::Break { start, end } if elapsed >= start && elapsed < end => Some((row, start, end)),
+      _ => None,
+    }) {
+      let span = (end - start).max(f64::EPSILON);
+      let break_progress = (((elapsed - start) / span).clamp(0.0, 1.0) * 48.0).round() as u8;
+      return Some(LyricMarker {
+        row,
+        word_end: 0,
+        word_progress: 0,
+        break_progress,
+        scroll_progress: scroll_for(Some(start)),
+        singing: true,
+      });
+    }
     let started = lines.partition_point(|line| line.start.is_some_and(|start| start <= elapsed));
     let index = started.saturating_sub(1);
     let line = &lines[index];
+    let row = rows
+      .iter()
+      .position(|item| matches!(*item, LyricRow::Line(line_index) if line_index == index))?;
     let word = line
       .words
       .iter()
@@ -584,25 +673,20 @@ impl Model {
         ((elapsed - word.start) / span * 16.0).clamp(0.0, 16.0) as u8
       }
     });
-    let scroll_progress = if !self.lyrics_scrolled && self.track.progressing_since.is_some() {
-      line.start.map_or(1024, |start| {
-        (((elapsed - start) / 0.28) * 1024.0).clamp(0.0, 1024.0) as u16
-      })
-    } else {
-      1024
-    };
     Some(LyricMarker {
-      index,
+      row,
       word_end: word.map_or(0, |word| word.end_byte),
       word_progress: progress,
-      scroll_progress,
+      break_progress: 0,
+      scroll_progress: scroll_for(line.start),
       singing: started > 0 && line.end.is_none_or(|end| elapsed <= end),
     })
   }
 
   pub fn animated_lyric_marker(&self) -> Option<LyricMarker> {
     let marker = self.lyric_marker()?;
-    let start = self.lyrics.lines[marker.index].start?;
+    let rows = lyric_rows(&self.lyrics.lines);
+    let start = rows.get(marker.row)?.start(&self.lyrics.lines)?;
     (!self.lyrics_scrolled
       || self
         .lyric_hits
@@ -614,7 +698,7 @@ impl Model {
 
   pub fn lyric_scroll_animating(&self) -> bool {
     self.lyric_marker().is_some_and(|marker| {
-      marker.index > 0 && marker.scroll_progress < 1024 && !self.lyrics_scrolled
+      marker.row > 0 && marker.scroll_progress < 1024 && !self.lyrics_scrolled
     })
   }
 
@@ -715,7 +799,7 @@ impl Model {
           .queue
           .len()
           .saturating_sub(self.track.queue_index + 1),
-        MusicTab::Lyrics => self.lyrics.lines.len(),
+        MusicTab::Lyrics => lyric_row_count(&self.lyrics.lines),
         MusicTab::Search if self.playlist_target.is_some() => self.playlist_targets().count(),
         MusicTab::Search => self.search_results.len(),
       },
@@ -747,9 +831,9 @@ impl Model {
         && !self.lyrics_scrolled
         && let Some(marker) = self.lyric_marker()
       {
-        let anchor = marker.index.saturating_sub(1);
-        if (amount < 0.0 && marker.index == 0)
-          || (amount > 0.0 && anchor + 1 >= self.lyrics.lines.len())
+        let anchor = marker.row.saturating_sub(1);
+        if (amount < 0.0 && marker.row == 0)
+          || (amount > 0.0 && anchor + 1 >= lyric_row_count(&self.lyrics.lines))
         {
           return;
         }
@@ -2697,53 +2781,103 @@ fn lyric_layout(cr: &Context, text: &str) -> pango::Layout {
     }
     let layout = text_layout(cr, text, 29, Weight::Semibold);
     layout.set_width(LYRICS_WIDTH * SCALE);
+    layout.set_alignment(Alignment::Center);
     layout.set_wrap(pango::WrapMode::WordChar);
     cache.insert(key, layout.clone());
     layout
   })
 }
 
+fn paint_music_note(cr: &Context, x: f64, y: f64, scale: f64) -> cairo::Result<()> {
+  cr.save()?;
+  cr.translate(x, y);
+  cr.scale(scale, scale);
+  cr.set_line_width(1.8);
+  cr.new_sub_path();
+  cr.arc(-2.5, 4.5, 3.3, 0.0, std::f64::consts::TAU);
+  cr.fill()?;
+  cr.move_to(0.4, 4.5);
+  cr.line_to(0.4, -7.5);
+  cr.curve_to(1.6, -5.2, 4.6, -5.2, 5.2, -1.8);
+  cr.stroke()?;
+  cr.restore()
+}
+
+fn blend_color(from: u32, to: u32, t: f64) -> (f64, f64, f64) {
+  let mix = |shift: u32| {
+    let a = f64::from((from >> shift) & 0xff) / 255.0;
+    let b = f64::from((to >> shift) & 0xff) / 255.0;
+    a + (b - a) * t
+  };
+  (mix(16), mix(8), mix(0))
+}
+
 fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
   let mut hits = model.lyric_hits.borrow_mut();
   hits.clear();
   if let Some(status) = &model.lyrics_status {
-    color(cr, 0xa6adc8, 1.0);
-    label(
-      cr,
-      status,
-      (LYRICS_LEFT, LYRICS_TOP + 30, LYRICS_WIDTH),
-      19,
-      Weight::Normal,
-      Alignment::Left,
-    );
+    let center_y = LYRICS_TOP + (LYRICS_BOTTOM - LYRICS_TOP) / 2;
+    if model.lyrics.instrumental {
+      color(cr, model.music_accent(), 0.85);
+      paint_music_note(
+        cr,
+        f64::from(LYRICS_LEFT + LYRICS_WIDTH / 2),
+        f64::from(center_y - 24),
+        1.7,
+      )?;
+      color(cr, 0xa6adc8, 1.0);
+      label(
+        cr,
+        status,
+        (LYRICS_LEFT, center_y + 4, LYRICS_WIDTH),
+        19,
+        Weight::Normal,
+        Alignment::Center,
+      );
+    } else {
+      color(cr, 0xa6adc8, 1.0);
+      label(
+        cr,
+        status,
+        (LYRICS_LEFT, center_y - 14, LYRICS_WIDTH),
+        19,
+        Weight::Normal,
+        Alignment::Center,
+      );
+    }
     return Ok(());
   }
+  let rows = lyric_rows(&model.lyrics.lines);
   let marker = model.lyric_marker();
-  let current = marker.map(|marker| marker.index);
+  let current = marker.map(|marker| marker.row);
   let follow = current.is_some() && !model.lyrics_scrolled;
-  let (offset, mut y) = if let Some(marker) = marker.filter(|_| follow) {
-    let anchor = LYRICS_TOP + (LYRICS_BOTTOM - LYRICS_TOP) * 3 / 10;
-    let height = |index: usize| {
+  let row_height = |row: LyricRow| match row {
+    LyricRow::Break { .. } => LYRICS_BREAK_HEIGHT,
+    LyricRow::Line(index) => {
       lyric_layout(cr, &model.lyrics.lines[index].text)
         .pixel_size()
         .1
         + 20
-    };
-    let mut offset = marker.index;
+    }
+  };
+  let (offset, mut y) = if let Some(marker) = marker.filter(|_| follow) {
+    let anchor = LYRICS_TOP + (LYRICS_BOTTOM - LYRICS_TOP) * 35 / 100;
+    let mut offset = marker.row;
     let mut y = f64::from(anchor);
     if offset > 0 {
       let t = f64::from(marker.scroll_progress) / 1024.0;
       let remaining = 1.0 - t * t * (3.0 - 2.0 * t);
-      y += remaining * f64::from(height(offset - 1));
+      y += remaining * f64::from(row_height(rows[offset - 1]));
     }
     while offset > 0 && y > f64::from(LYRICS_TOP) {
       offset -= 1;
-      y -= f64::from(height(offset));
+      y -= f64::from(row_height(rows[offset]));
     }
     (offset, y)
   } else {
-    (model.offset, f64::from(LYRICS_TOP))
+    (model.offset.min(rows.len()), f64::from(LYRICS_TOP))
   };
+  let elapsed = model.playback_position();
   cr.save()?;
   cr.rectangle(
     f64::from(LYRICS_LEFT),
@@ -2754,41 +2888,12 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
   cr.clip();
   cr.push_group();
   let fade_top = y < f64::from(LYRICS_TOP);
-  for (index, line) in model.lyrics.lines.iter().enumerate().skip(offset) {
+  for (row_index, row) in rows.iter().copied().enumerate().skip(offset) {
     if y >= f64::from(LYRICS_BOTTOM) {
       break;
     }
-    let active = marker.filter(|marker| marker.index == index);
-    let layout = lyric_layout(cr, &line.text);
-    let attrs = active
-      .filter(|marker| marker.singing && marker.word_end > 0)
-      .map(|marker| {
-        let end = marker.word_end;
-        let progress = marker.word_progress;
-        let attrs = pango::AttrList::new();
-        let previous = line
-          .words
-          .iter()
-          .take_while(|word| word.end_byte < end)
-          .last()
-          .map_or(0, |word| word.end_byte);
-        let mut sung = pango::AttrColor::new_foreground(0xffff, 0xf9f9, 0xf8f8);
-        sung.set_end_index(previous);
-        attrs.insert(sung);
-        let tint =
-          |from: u16, to: u16| from + ((u32::from(to - from) * u32::from(progress)) / 16) as u16;
-        let mut word = pango::AttrColor::new_foreground(
-          tint(0xacac, 0xffff),
-          tint(0xaaaa, 0xf9f9),
-          tint(0xc0c0, 0xf8f8),
-        );
-        word.set_start_index(previous);
-        word.set_end_index(end);
-        attrs.insert(word);
-        attrs
-      });
-    layout.set_attributes(attrs.as_ref());
-    let height = layout.pixel_size().1 + 20;
+    let active = marker.filter(|marker| marker.row == row_index);
+    let height = row_height(row);
     let top = y.floor() as i32;
     let bottom = (y + f64::from(height)).ceil() as i32;
     let hovered = current.is_some()
@@ -2799,28 +2904,96 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
         LYRICS_WIDTH,
         bottom.min(LYRICS_BOTTOM) - top.max(LYRICS_TOP),
       );
-    let (ink, alpha) = if active.is_some() {
-      (
-        if line.words.is_empty() || active.is_some_and(|marker| !marker.singing) {
-          0xfff9f8
+    match row {
+      LyricRow::Break { start, end } => {
+        let center_x = f64::from(LYRICS_LEFT + LYRICS_WIDTH / 2);
+        let center_y = y + f64::from(height) / 2.0 - 4.0;
+        let past = elapsed >= end;
+        let progress = active
+          .map(|marker| f64::from(marker.break_progress) / 48.0)
+          .unwrap_or(0.0);
+        let accent = model.music_accent();
+        for note in 0..3 {
+          let note_x = center_x + f64::from(note - 1) * 28.0;
+          if active.is_some() {
+            let note_progress = (progress * 3.0 - f64::from(note)).clamp(0.0, 1.0);
+            let (r, g, b) = blend_color(0xcdd6f4, accent, note_progress);
+            let alpha = 0.45 + 0.55 * note_progress;
+            cr.set_source_rgba(r, g, b, alpha);
+            paint_music_note(cr, note_x, center_y, 1.45 + 0.12 * note_progress)?;
+          } else {
+            let alpha = if hovered || !follow {
+              0.9
+            } else if past {
+              0.32
+            } else {
+              0.48
+            };
+            color(cr, 0xcdd6f4, alpha);
+            paint_music_note(cr, note_x, center_y, 1.45)?;
+          }
+        }
+        if bottom > LYRICS_TOP {
+          hits.push((top.max(LYRICS_TOP), bottom.min(LYRICS_BOTTOM), start));
+        }
+      }
+      LyricRow::Line(index) => {
+        let line = &model.lyrics.lines[index];
+        let layout = lyric_layout(cr, &line.text);
+        let attrs = active
+          .filter(|marker| marker.singing && marker.word_end > 0)
+          .map(|marker| {
+            let end = marker.word_end;
+            let progress = marker.word_progress;
+            let attrs = pango::AttrList::new();
+            let previous = line
+              .words
+              .iter()
+              .take_while(|word| word.end_byte < end)
+              .last()
+              .map_or(0, |word| word.end_byte);
+            let mut sung = pango::AttrColor::new_foreground(0xffff, 0xf9f9, 0xf8f8);
+            sung.set_end_index(previous);
+            attrs.insert(sung);
+            let tint =
+              |from: u16, to: u16| from + ((u32::from(to - from) * u32::from(progress)) / 16) as u16;
+            let mut word = pango::AttrColor::new_foreground(
+              tint(0xacac, 0xffff),
+              tint(0xaaaa, 0xf9f9),
+              tint(0xc0c0, 0xf8f8),
+            );
+            word.set_start_index(previous);
+            word.set_end_index(end);
+            attrs.insert(word);
+            attrs
+          });
+        layout.set_attributes(attrs.as_ref());
+        let (ink, alpha) = if active.is_some() {
+          (
+            if line.words.is_empty() || active.is_some_and(|marker| !marker.singing) {
+              0xfff9f8
+            } else {
+              0xacaac0
+            },
+            1.0,
+          )
+        } else if hovered || !follow {
+          (0xcdd6f4, 1.0)
+        } else if current.is_some_and(|current| row_index < current) {
+          (0xcdd6f4, 0.40)
         } else {
-          0xacaac0
-        },
-        1.0,
-      )
-    } else if hovered || !follow {
-      (0xcdd6f4, 1.0)
-    } else {
-      let distance = current.unwrap_or(index).abs_diff(index).min(5) as f64;
-      (0xcdd6f4, 0.68 - distance * 0.044)
-    };
-    color(cr, ink, alpha);
-    cr.move_to(f64::from(LYRICS_LEFT), y);
-    pangocairo::functions::show_layout(cr, &layout);
-    if let Some(start) = line.start
-      && bottom > LYRICS_TOP
-    {
-      hits.push((top.max(LYRICS_TOP), bottom.min(LYRICS_BOTTOM), start));
+          let distance = current.unwrap_or(row_index).abs_diff(row_index).min(5) as f64;
+          (0xcdd6f4, (0.62 - distance * 0.04).max(0.38))
+        };
+        color(cr, ink, alpha);
+        cr.move_to(f64::from(LYRICS_LEFT), y);
+        pangocairo::functions::show_layout(cr, &layout);
+        if let Some(start) = line.start
+          && bottom > LYRICS_TOP
+        {
+          hits.push((top.max(LYRICS_TOP), bottom.min(LYRICS_BOTTOM), start));
+        }
+      }
     }
     y += f64::from(height);
   }
