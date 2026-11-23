@@ -385,6 +385,13 @@ def normalized(text):
     return "".join(char for char in text.casefold() if char.isalnum())
 
 
+def recording_title(title):
+    # Providers may list featured artists separately from the recording title.
+    # Keep suffixes that identify the version, including remix and live labels.
+    return re.sub(r"\s*[\[(](?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]\s*$",
+                  "", title, flags=re.IGNORECASE).strip()
+
+
 def netease_request(path, **params):
     url = f"https://music.163.com/api/{path}?{urlencode(params)}"
     request = Request(url, headers={"Referer": "https://music.163.com", "User-Agent": "Lintel"})
@@ -405,7 +412,7 @@ def netease_lyrics(title, artist, duration):
         try:
             names = {normalized(person["name"]) for person in song["artists"]}
             drift = abs(song["duration"] / 1000 - duration)
-            if normalized(song["name"]) == normalized(title) and artists <= names and drift <= 3:
+            if normalized(recording_title(song["name"])) == normalized(title) and artists <= names and drift <= 3:
                 matches.append((len(names - artists), drift, song["id"]))
         except (KeyError, TypeError, AttributeError):
             continue
@@ -428,7 +435,7 @@ def kugou_lyrics(title, artist, duration):
         matches = [
             item for item in response.get("candidates", [])
             if item.get("krctype") == 2
-            and normalized(item["song"]) == normalized(title)
+            and normalized(recording_title(item["song"])) == normalized(title)
             and normalized(item["singer"]) == normalized(artist)
             and abs(item["duration"] - length) <= 8000
         ]
@@ -447,6 +454,7 @@ def kugou_lyrics(title, artist, duration):
 def word_lyrics(title, artist, duration):
     if not (title and artist and duration > 0):
         return None
+    title = recording_title(title)
     replies = Queue()
 
     def lookup(provider):
