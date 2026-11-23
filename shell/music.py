@@ -409,6 +409,14 @@ def lrc_lines(text):
 
 
 def lrclib_lyrics(title, artist, duration):
+    result = lrclib_match(title, artist, duration)
+    if result is None and (parts := re.fullmatch(r"(.+?)\s+[-–—]\s+(.+)", title)):
+        # Video uploads can credit the uploader while naming the artist in the title.
+        result = lrclib_match(parts[2], parts[1], duration)
+    return result
+
+
+def lrclib_match(title, artist, duration):
     query = urlencode({"track_name": title, "artist_name": artist})
     request = Request("https://lrclib.net/api/search?" + query, headers={"User-Agent": "Lintel"})
     with urlopen(request, timeout=3) as response:
@@ -581,8 +589,8 @@ def read_cached_lyrics(path):
     try:
         age = time.time() - path.stat().st_mtime
         reply = json.loads(path.read_text())
-        # Retry older misses that did not recognize instrumental recordings.
-        if reply["result"] is None and not reply.get("instrumental_checked"):
+        # Retry misses recorded before checking the artist named in upload titles.
+        if reply["result"] is None and not reply.get("upload_title_checked"):
             return None
         if age < (30 * 86400 if reply["word_timed"] else 86400):
             return reply
@@ -594,7 +602,7 @@ def read_cached_lyrics(path):
 def keep_lyrics(path, result):
     try:
         word_timed = any(line.get("words") for line in (result or {}).get("lines", []))
-        save_json(path, {"word_timed": word_timed, "result": result, "instrumental_checked": True})
+        save_json(path, {"word_timed": word_timed, "result": result, "upload_title_checked": True})
         files = [entry for entry in LYRIC_CACHE.iterdir() if entry.is_file()]
         if len(files) > 128:
             for entry in sorted(files, key=lambda item: item.stat().st_mtime)[:-128]:
