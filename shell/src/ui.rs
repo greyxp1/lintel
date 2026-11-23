@@ -41,6 +41,8 @@ const MUSIC_BOTTOM: i32 = TRANSPORT_END + 17;
 const TAB_END: i32 = MUSIC_BOTTOM - 3;
 const SEARCH_END: i32 = TAB_END - 22;
 const COVER_Y: i32 = PANEL_Y + 10;
+const PLAYER_TITLE_Y: i32 = PANEL_Y + 219;
+const PLAYER_ARTIST_Y: i32 = PANEL_Y + 239;
 const LYRICS_SHIFT: i32 = 174;
 const LYRICS_LEFT: i32 = MUSIC_LEFT + 12;
 const LYRICS_WIDTH: i32 = WIDTH - 2 * LYRICS_LEFT;
@@ -2210,20 +2212,33 @@ fn row_title(
   Ok(())
 }
 
+fn player_title_bounds(model: &Model) -> (i32, i32, i32, i32) {
+  if model.lyrics_view() {
+    (
+      MUSIC_LEFT + 72,
+      LYRICS_FOOTER_Y + 17,
+      PLAYER_X - MUSIC_LEFT - 86,
+      23,
+    )
+  } else {
+    (
+      PLAYER_X + 12,
+      PLAYER_TITLE_Y,
+      PLAYER_WIDTH - 24,
+      PLAYER_ARTIST_Y - PLAYER_TITLE_Y,
+    )
+  }
+}
+
 fn player_title(cr: &Context, model: &Model) -> cairo::Result<()> {
   let title = model
     .starting_song
     .as_ref()
     .map_or(model.track.title.as_str(), |(song, _)| song.title.as_str());
-  let rect = if model.lyrics_view() {
-    (
-      MUSIC_LEFT + 72,
-      LYRICS_FOOTER_Y + 17,
-      PLAYER_X - MUSIC_LEFT - 86,
-    )
-  } else {
-    (PLAYER_X + 12, PANEL_Y + 219, PLAYER_WIDTH - 24)
-  };
+  let (x, y, width, height) = player_title_bounds(model);
+  cr.save()?;
+  cr.rectangle(x.into(), y.into(), width.into(), height.into());
+  cr.clip();
   let start = model.title_scroll.get().unwrap_or_else(Instant::now);
   model.title_scroll.set(Some(start));
   color(cr, 0xcdd6f4, 1.0);
@@ -2234,13 +2249,13 @@ fn player_title(cr: &Context, model: &Model) -> cairo::Result<()> {
     } else {
       title
     },
-    rect,
+    (x, y, width),
     15,
     Weight::Semibold,
     !model.lyrics_view(),
     Some(start),
   )?);
-  Ok(())
+  cr.restore()
 }
 
 fn search_symbol(cr: &Context, x: i32, y: i32) -> cairo::Result<()> {
@@ -3092,7 +3107,7 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
     label(
       cr,
       artist,
-      (PLAYER_X + 12, PANEL_Y + 239, PLAYER_WIDTH - 24),
+      (PLAYER_X + 12, PLAYER_ARTIST_Y, PLAYER_WIDTH - 24),
       12,
       Weight::Normal,
       Alignment::Center,
@@ -3479,17 +3494,25 @@ fn paint_popup(
   round(cr, 0, 0, POPUP_WIDTH, POPUP_HEIGHT, POPUP_RADIUS);
   color(cr, if hovered { 0x29283b } else { 0x1e1e2e }, model.opacity);
   cr.fill()?;
-  round(
-    cr,
-    1,
-    1,
-    POPUP_WIDTH - 2,
-    POPUP_HEIGHT - 2,
-    POPUP_RADIUS - 1.0,
-  );
+  let width = POPUP_WIDTH - 2;
+  let height = POPUP_HEIGHT - 2;
+  let radius = POPUP_RADIUS - 1.0;
+  round(cr, 1, 1, width, height, radius);
   color(cr, 0xcba6f7, 0.46);
   cr.set_line_width(1.0);
-  cr.stroke()?;
+  cr.stroke_preserve()?;
+  if let Some(countdown) = &notice.countdown {
+    let fraction = countdown.remaining().as_secs_f64() / countdown.duration.as_secs_f64();
+    if fraction > 0.0 {
+      let perimeter = f64::from(2 * (width + height)) - (8.0 - std::f64::consts::TAU) * radius;
+      cr.save()?;
+      cr.set_dash(&[perimeter * fraction.min(1.0), perimeter], 0.0);
+      color(cr, 0xcba6f7, 0.92);
+      cr.stroke()?;
+      cr.restore()?;
+    }
+  }
+  cr.new_path();
   let text_x = notice.popup_text_x();
   if let Some(icon) = &notice.image {
     picture(cr, Some(icon), POPUP_PADDING, 14, 36, "")?;
@@ -3549,30 +3572,6 @@ fn paint_popup(
       Weight::Semibold,
       Alignment::Center,
     );
-  }
-  if let Some(countdown) = &notice.countdown {
-    let fraction = countdown.remaining().as_secs_f64() / countdown.duration.as_secs_f64();
-    cr.save()?;
-    cr.rectangle(
-      0.0,
-      0.0,
-      f64::from(POPUP_WIDTH) * fraction,
-      POPUP_RADIUS + 1.0,
-    );
-    cr.clip();
-    round(
-      cr,
-      1,
-      1,
-      POPUP_WIDTH - 2,
-      POPUP_HEIGHT - 2,
-      POPUP_RADIUS - 1.0,
-    );
-    color(cr, 0xcba6f7, 0.92);
-    cr.set_operator(Operator::Source);
-    cr.set_line_width(1.0);
-    cr.stroke()?;
-    cr.restore()?;
   }
   Ok(())
 }
@@ -3696,13 +3695,7 @@ impl BarRegion {
         WIDTH - 2 * MUSIC_LEFT,
         LYRICS_BOTTOM - LYRICS_TOP,
       ),
-      Self::MusicTitle if model.lyrics_view() => (
-        MUSIC_LEFT + 72,
-        LYRICS_FOOTER_Y + 17,
-        PLAYER_X - MUSIC_LEFT - 86,
-        23,
-      ),
-      Self::MusicTitle => (PLAYER_X + 12, PANEL_Y + 219, PLAYER_WIDTH - 24, 24),
+      Self::MusicTitle => player_title_bounds(model),
       Self::MusicList => (
         MUSIC_LEFT - 4,
         LIST_Y,
