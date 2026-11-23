@@ -178,6 +178,7 @@ pub struct Desktop {
   caret_tick: Option<Instant>,
   bar_keyboard_focus: bool,
   bar_on_demand: bool,
+  bar_overlay: bool,
   target: Option<Layer>,
   xy: (f64, f64),
   model: Rc<RefCell<Model>>,
@@ -215,6 +216,7 @@ impl Desktop {
       caret_tick: None,
       bar_keyboard_focus: false,
       bar_on_demand: false,
+      bar_overlay: false,
       target: None,
       xy: (0.0, 0.0),
       model,
@@ -381,6 +383,7 @@ impl Desktop {
       self.popup = None;
     }
     if let Some(bar) = &mut self.bar {
+      let mut commit = false;
       let on_demand = model.panel != ui::Panel::None;
       if self.bar_on_demand != on_demand {
         self.bar_on_demand = on_demand;
@@ -390,16 +393,29 @@ impl Desktop {
         } else {
           KeyboardInteractivity::None
         });
-        bar.surface.commit();
+        commit = true;
       }
       let wanted = (
         WIDTH,
         bar_buffer_height(bar.animate_height(model.bar_height())?),
       );
+      let overlay = wanted.1 > ui::REVEAL_HEIGHT;
+      if self.bar_overlay != overlay {
+        self.bar_overlay = overlay;
+        bar.layer.set_layer(if overlay {
+          zwlr_layer_shell_v1::Layer::Overlay
+        } else {
+          zwlr_layer_shell_v1::Layer::Top
+        });
+        commit = true;
+      }
       if bar.requested != wanted {
         bar.layer.set_size(wanted.0 as u32, wanted.1 as u32);
-        bar.surface.commit();
         bar.requested = wanted;
+        commit = true;
+      }
+      if commit {
+        bar.surface.commit();
       }
       Self::draw(
         &self.shm,
