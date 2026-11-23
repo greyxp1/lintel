@@ -60,7 +60,7 @@ pub const CORNER_SIZE: i32 = 20;
 pub const PANEL_WIDTH: i32 = HEADER_WIDTH - 2 * WING;
 const PANEL_X: i32 = (WIDTH - PANEL_WIDTH) / 2;
 const PANEL_Y: i32 = HEIGHT;
-const COVER: i32 = 160;
+const COVER: i32 = 190;
 
 const ROW_HEIGHT: i32 = 40;
 const VISIBLE_ROWS: usize = 6;
@@ -75,8 +75,7 @@ const SIGN_IN_X: i32 = PANEL_X + 16;
 const SIGN_IN_Y: i32 = PANEL_Y + 12;
 const SIGN_IN_WIDTH: i32 = PANEL_WIDTH - 32;
 const SIGN_IN_BUTTON_HEIGHT: i32 = 38;
-const SIGN_OUT_Y: i32 = TAB_Y;
-const PLAYER_SIGN_OUT_X: i32 = PLAYER_X + PLAYER_WIDTH - TAB_WIDTH - 12;
+const PLAYER_SIGN_OUT_X: i32 = PLAYER_X + 13;
 const PLAYER_REMOVE_X: i32 = PLAYER_X + PLAYER_WIDTH - TAB_WIDTH - 15;
 const SIGN_OUT_WIDTH: i32 = 38;
 const RECONNECT_WIDTH: i32 = SIGN_IN_WIDTH - SIGN_OUT_WIDTH - 8;
@@ -1415,9 +1414,9 @@ impl Model {
         && inside(
           Some((f64::from(x), f64::from(y))),
           PLAYER_SIGN_OUT_X,
-          SIGN_OUT_Y,
+          PANEL_Y + TRANSPORT_Y + self.player_shift(),
           TAB_WIDTH,
-          MUSIC_TAB_HEIGHT,
+          27,
         )
       {
         self.confirmation = Some(MusicConfirmation::SignOut);
@@ -2075,6 +2074,22 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
   cr.line_to(trash + 4.5, 18.0);
   cr.stroke()?;
 
+  if !model.playlist_busy
+    && inside(
+      model.bar_pointer,
+      PLAYER_SIGN_OUT_X,
+      PANEL_Y + TRANSPORT_Y + model.player_shift(),
+      TAB_WIDTH,
+      27,
+    )
+  {
+    round(cr, PLAYER_SIGN_OUT_X, 5, TAB_WIDTH, 27, 6.0);
+    color(cr, 0xcba6f7, 0.16);
+    cr.fill()?;
+  }
+  color(cr, 0xa6adc8, if model.playlist_busy { 0.5 } else { 1.0 });
+  sign_out_symbol(cr, f64::from(PLAYER_SIGN_OUT_X + TAB_WIDTH / 2), 18.0)?;
+
   Ok(())
 }
 
@@ -2317,32 +2332,6 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
     );
   }
 
-  if !model.playlist_busy
-    && inside(
-      model.bar_pointer,
-      PLAYER_SIGN_OUT_X,
-      SIGN_OUT_Y,
-      TAB_WIDTH,
-      MUSIC_TAB_HEIGHT,
-    )
-  {
-    round(
-      cr,
-      PLAYER_SIGN_OUT_X,
-      SIGN_OUT_Y,
-      TAB_WIDTH,
-      MUSIC_TAB_HEIGHT,
-      7.0,
-    );
-    color(cr, 0xcba6f7, 0.16);
-    cr.fill()?;
-  }
-  color(cr, 0xa6adc8, if model.playlist_busy { 0.5 } else { 1.0 });
-  sign_out_symbol(
-    cr,
-    f64::from(PLAYER_SIGN_OUT_X + TAB_WIDTH / 2),
-    f64::from(SIGN_OUT_Y + MUSIC_TAB_HEIGHT / 2),
-  )?;
   if model.lyrics_view() {
     return paint_lyrics(cr, model);
   }
@@ -3107,7 +3096,7 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
         .filter(|(url, _)| url == model.cover_url())
         .and_then(|(_, cover)| cover.as_ref()),
       PLAYER_X + (PLAYER_WIDTH - COVER) / 2,
-      PANEL_Y + 55,
+      PANEL_Y + 23,
       COVER,
       "♪",
     )?;
