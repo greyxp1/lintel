@@ -37,11 +37,11 @@ const MUSIC_TAB_HEIGHT: i32 = 32;
 const SAVE_WIDTH: i32 = 55;
 const SAVE_X: i32 = PLAYER_X - SAVE_WIDTH - 12;
 const LIST_Y: i32 = PANEL_Y + 60;
-const MUSIC_BOTTOM: i32 = TRANSPORT_END + 82;
+const MUSIC_BOTTOM: i32 = TRANSPORT_END + 24;
 const TAB_END: i32 = MUSIC_BOTTOM - 3;
 const SEARCH_END: i32 = TAB_END - 22;
-const MUSIC_GAIN_START: i32 = PLAYER_X + 100;
-const MUSIC_GAIN_END: i32 = PLAYER_X + PLAYER_WIDTH - 56;
+const MUSIC_GAIN_TOP: i32 = PANEL_Y + 92;
+const MUSIC_GAIN_BOTTOM: i32 = PANEL_Y + 197;
 const LYRICS_SHIFT: i32 = 174;
 const LYRICS_LEFT: i32 = MUSIC_LEFT + 12;
 const LYRICS_WIDTH: i32 = WIDTH - 2 * LYRICS_LEFT;
@@ -303,9 +303,9 @@ impl Slider {
     }
   }
 
-  pub fn position(self, x: i32, _y: i32) -> u8 {
+  pub fn position(self, x: i32, y: i32) -> u8 {
     if matches!(self, Self::Music(_) | Self::MusicLevel(..)) {
-      return ((x - MUSIC_GAIN_START) * 100 / (MUSIC_GAIN_END - MUSIC_GAIN_START)).clamp(0, 100)
+      return ((MUSIC_GAIN_BOTTOM - y) * 100 / (MUSIC_GAIN_BOTTOM - MUSIC_GAIN_TOP)).clamp(0, 100)
         as u8;
     }
     ((x - self.start()) * 100 / (SLIDER_END - self.start())).clamp(0, 100) as u8
@@ -1371,10 +1371,10 @@ impl Model {
       }
       if self.signed_in
         && !self.lyrics_view()
-        && (MUSIC_GAIN_START - 5..=MUSIC_GAIN_END + 5).contains(&x)
+        && (MUSIC_GAIN_TOP - 6..=MUSIC_GAIN_BOTTOM + 6).contains(&y)
       {
         for channel in MusicChannel::ALL {
-          if (y - music_gain_y(channel)).abs() <= 11
+          if (x - music_gain_x(channel)).abs() <= 12
             && let Some((slider, _)) = self.music_slider(channel)
           {
             return Some(Action::Volume(
@@ -1652,12 +1652,22 @@ fn audio_slider_y(index: usize) -> i32 {
   PANEL_Y + 43 + index as i32 * 35
 }
 
-fn music_gain_y(channel: MusicChannel) -> i32 {
-  TRANSPORT_END + 16 + channel as i32 * 29
+fn music_gain_x(channel: MusicChannel) -> i32 {
+  let inset = (PLAYER_WIDTH - COVER) / 4;
+  match channel {
+    MusicChannel::Listen => PLAYER_X + inset,
+    MusicChannel::Send => PLAYER_X + PLAYER_WIDTH - inset,
+  }
 }
 
 fn music_gain_icon_hit(pointer: Option<(f64, f64)>, channel: MusicChannel) -> bool {
-  inside(pointer, PLAYER_X + 10, music_gain_y(channel) - 13, 26, 26)
+  inside(
+    pointer,
+    music_gain_x(channel) - 13,
+    MUSIC_GAIN_TOP - 30,
+    26,
+    26,
+  )
 }
 
 fn audio_button_hit(pointer: Option<(f64, f64)>, index: usize) -> bool {
@@ -2127,15 +2137,10 @@ fn marquee(
     pangocairo::functions::show_layout(cr, &layout);
     return Ok(false);
   }
-  let distance = f64::from(measured - width);
-  let duration = distance / 42.0;
+  let period = f64::from(measured + 36);
   let offset = started.map_or(0.0, |time| {
-    let phase = time.elapsed().as_secs_f64() % (2.0 * duration + 2.0);
-    if phase < 1.0 + duration {
-      ((phase - 1.0) * 42.0).clamp(0.0, distance)
-    } else {
-      (distance - (phase - 2.0 - duration) * 42.0).clamp(0.0, distance)
-    }
+    let phase = time.elapsed().as_secs_f64() % (1.0 + period / 42.0);
+    ((phase - 1.0) * 42.0).max(0.0)
   });
   cr.save()?;
   cr.rectangle(
@@ -2148,12 +2153,16 @@ fn marquee(
   cr.push_group();
   cr.move_to(f64::from(x) - offset, f64::from(y));
   pangocairo::functions::show_layout(cr, &layout);
+  if offset + f64::from(width) > period {
+    cr.move_to(f64::from(x) + period - offset, f64::from(y));
+    pangocairo::functions::show_layout(cr, &layout);
+  }
   cr.pop_group_to_source()?;
   cr.mask(&edge_mask(
     f64::from(x),
     f64::from(x + width),
     offset > 0.1,
-    offset < distance - 0.1,
+    true,
     true,
   ))?;
   cr.restore()?;
@@ -2839,8 +2848,8 @@ fn paint_audio_device(cr: &Context, x: f64, y: f64, device: Device) -> cairo::Re
 }
 
 fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo::Result<()> {
-  let x = PLAYER_X + 23;
-  let icon_y = music_gain_y(channel);
+  let x = music_gain_x(channel);
+  let icon_y = MUSIC_GAIN_TOP - 17;
   let level = model.music_slider(channel);
   if level.is_none() && (channel == MusicChannel::Listen || !model.music_mix) {
     return Ok(());
@@ -2883,28 +2892,19 @@ fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo
     return Ok(());
   };
   let volume = model.volume(slider, Some(volume)).unwrap_or(volume);
-  color(cr, 0xa6adc8, 1.0);
-  label(
-    cr,
-    if send { "To mic" } else { "Listen" },
-    (PLAYER_X + 41, icon_y - 8, 54),
-    12,
-    Weight::Normal,
-    Alignment::Left,
-  );
-  let width = MUSIC_GAIN_END - MUSIC_GAIN_START;
+  let height = MUSIC_GAIN_BOTTOM - MUSIC_GAIN_TOP;
   color(cr, 0x45475a, 1.0);
-  round(cr, MUSIC_GAIN_START, icon_y - 2, width, 4, 2.0);
+  round(cr, x - 2, MUSIC_GAIN_TOP, 4, height, 2.0);
   cr.fill()?;
-  let filled = width * i32::from(volume.percent.min(100)) / 100;
+  let filled = height * i32::from(volume.percent.min(100)) / 100;
   if filled > 0 {
     color(cr, if volume.muted { 0x6c7086 } else { 0xcba6f7 }, 1.0);
     round(
       cr,
-      MUSIC_GAIN_START,
-      icon_y - 2,
-      filled,
+      x - 2,
+      MUSIC_GAIN_BOTTOM - filled,
       4,
+      filled,
       2.0_f64.min(f64::from(filled) / 2.0),
     );
     cr.fill()?;
@@ -2918,10 +2918,10 @@ fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo
   label(
     cr,
     &value,
-    (MUSIC_GAIN_END + 6, icon_y - 7, 39),
+    (x, MUSIC_GAIN_BOTTOM + 5, 0),
     10,
     Weight::Normal,
-    Alignment::Right,
+    Alignment::Center,
   );
   Ok(())
 }

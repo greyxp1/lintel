@@ -214,7 +214,7 @@ impl Desktop {
       repeated_key: None,
       caret_tick: None,
       bar_keyboard_focus: false,
-      bar_on_demand: true,
+      bar_on_demand: false,
       target: None,
       xy: (0.0, 0.0),
       model,
@@ -275,9 +275,7 @@ impl Desktop {
         .get_layer_surface(&surface, output, level, namespace.into(), &self.qh, kind);
     layer.set_anchor(anchor);
     match kind {
-      Layer::Bar => {
-        layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand)
-      }
+      Layer::Bar => {}
       Layer::Popup => layer.set_margin(HEIGHT + 8, 16, 0, 0),
       Layer::Corner(..) => {
         layer.set_exclusive_zone(-1);
@@ -383,7 +381,7 @@ impl Desktop {
       self.popup = None;
     }
     if let Some(bar) = &mut self.bar {
-      let on_demand = model.panel != ui::Panel::None || !self.bar_keyboard_focus;
+      let on_demand = model.panel != ui::Panel::None;
       if self.bar_on_demand != on_demand {
         self.bar_on_demand = on_demand;
         use zwlr_layer_surface_v1::KeyboardInteractivity;
