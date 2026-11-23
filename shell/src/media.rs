@@ -308,9 +308,12 @@ fn run_control(args: &[&str]) -> bool {
   if crate::audio::music_mix_enabled() {
     // The Pulse server only starts playback on public sinks. MyGo's ALSA
     // backend can address the private sink through PipeWire's default PCM.
+    // Mark the stream virtual so screenshare capture does not duplicate music
+    // that is already routed through the microphone mix.
     command
       .env("PULSE_SERVER", "unix:/dev/null")
-      .env("PIPEWIRE_NODE", crate::audio::MUSIC_SINK);
+      .env("PIPEWIRE_NODE", crate::audio::MUSIC_SINK)
+      .env("PIPEWIRE_PROPS", "{ node.virtual = true }");
   }
   match command.args(args).status() {
     Ok(status) => status.success(),
