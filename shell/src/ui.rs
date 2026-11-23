@@ -53,7 +53,7 @@ const LYRICS_BOTTOM: i32 = 473;
 const LYRICS_FOOTER_Y: i32 = 480;
 const INSTRUMENTAL_BREAK: f64 = 5.0;
 const LRC_LINE_DURATION: f64 = 4.0;
-const LYRICS_BREAK_HEIGHT: i32 = 48;
+const LYRICS_BREAK_HEIGHT: i32 = 54;
 const RESULTS_Y: i32 = LIST_Y + 41;
 const RESULTS_ROW: i32 = 46;
 const SEARCH_ROWS: usize = ((SEARCH_END - RESULTS_Y) / RESULTS_ROW) as usize;
@@ -71,7 +71,7 @@ const COVER: i32 = 204;
 const ROW_HEIGHT: i32 = 40;
 const VISIBLE_ROWS: usize = 6;
 pub const POPUP_WIDTH: i32 = 340;
-pub const POPUP_HEIGHT: i32 = 112;
+pub const POPUP_HEIGHT: i32 = 136;
 const POPUP_GAP: i32 = 8;
 const POPUP_LIMIT: usize = 3;
 pub const POPUP_RADIUS: f64 = 14.0;
@@ -86,8 +86,8 @@ const PLAYER_REMOVE_X: i32 = PLAYER_X + PLAYER_WIDTH - TAB_WIDTH - 15;
 const SIGN_OUT_WIDTH: i32 = 38;
 const RECONNECT_WIDTH: i32 = SIGN_IN_WIDTH - SIGN_OUT_WIDTH - 8;
 const VOLUME_FEEDBACK_HEIGHT: i32 = 32;
-const POPUP_CLOSE_X: i32 = POPUP_WIDTH - 34;
-const POPUP_CLOSE_Y: i32 = 10;
+const POPUP_CLOSE_X: i32 = POPUP_WIDTH - 32;
+const POPUP_CLOSE_Y: i32 = 12;
 const POPUP_CLOSE_SIZE: i32 = 24;
 const AUDIO_NAME_X: i32 = PANEL_X + 43;
 const AUDIO_BUTTON_SIZE: i32 = 28;
@@ -238,6 +238,18 @@ fn instrumental_break_before(lines: &[LyricLine], index: usize) -> Option<(f64, 
   if index == 0 {
     return (start >= INSTRUMENTAL_BREAK).then_some((0.0, start));
   }
+  if lines[index - 1].text.trim().is_empty() {
+    let mut first_blank = index - 1;
+    while first_blank > 0 && lines[first_blank - 1].text.trim().is_empty() {
+      first_blank -= 1;
+    }
+    let break_start = if first_blank == 0 {
+      0.0
+    } else {
+      lines[first_blank].start?
+    };
+    return (start - break_start >= INSTRUMENTAL_BREAK).then_some((break_start, start));
+  }
   let previous = &lines[index - 1];
   if let Some(end) = lyric_sung_end(previous) {
     return (start - end >= INSTRUMENTAL_BREAK).then_some((end, start));
@@ -250,7 +262,10 @@ fn instrumental_break_before(lines: &[LyricLine], index: usize) -> Option<(f64, 
 fn lyric_rows(lines: &[LyricLine]) -> Vec<LyricRow> {
   let synced = lines.first().and_then(|line| line.start).is_some();
   let mut rows = Vec::with_capacity(lines.len());
-  for index in 0..lines.len() {
+  for (index, line) in lines.iter().enumerate() {
+    if line.text.trim().is_empty() {
+      continue;
+    }
     if synced && let Some((start, end)) = instrumental_break_before(lines, index) {
       rows.push(LyricRow::Break { start, end });
     }
@@ -260,13 +275,7 @@ fn lyric_rows(lines: &[LyricLine]) -> Vec<LyricRow> {
 }
 
 fn lyric_row_count(lines: &[LyricLine]) -> usize {
-  if lines.first().and_then(|line| line.start).is_none() {
-    return lines.len();
-  }
-  lines.len()
-    + (0..lines.len())
-      .filter(|&index| instrumental_break_before(lines, index).is_some())
-      .count()
+  lyric_rows(lines).len()
 }
 
 struct PlaylistTarget {
@@ -655,7 +664,11 @@ impl Model {
       });
     }
     let started = lines.partition_point(|line| line.start.is_some_and(|start| start <= elapsed));
-    let index = started.saturating_sub(1);
+    let raw_index = started.saturating_sub(1);
+    let index = (0..=raw_index)
+      .rev()
+      .find(|&i| !lines[i].text.trim().is_empty())
+      .or_else(|| lines.iter().position(|line| !line.text.trim().is_empty()))?;
     let line = &lines[index];
     let row = rows
       .iter()
@@ -890,7 +903,7 @@ impl Model {
     self.popup_pointer = pointer;
     let after = self.popup_at_pointer();
     let close = after
-      .filter(|(_, close)| *close)
+      .filter(|(_, target)| *target == PopupTarget::Close)
       .and_then(|(row, _)| self.popups().nth(row))
       .map(|notice| notice.id);
     let changed = close != self.popup_close_hover;
@@ -898,13 +911,32 @@ impl Model {
     changed || after != before
   }
 
-  fn popup_at_pointer(&self) -> Option<(usize, bool)> {
+  fn popup_at_pointer(&self) -> Option<(usize, PopupTarget)> {
     let (x, y) = self.popup_pointer?;
     let stride = POPUP_HEIGHT + POPUP_GAP;
+    let x = x.floor() as i32;
     let y = y.floor() as i32;
     let row = usize::try_from(y.div_euclid(stride)).ok()?;
     let y = y.rem_euclid(stride);
-    (row < POPUP_LIMIT && y < POPUP_HEIGHT).then(|| (row, popup_close_hit(x.floor() as i32, y)))
+    if row >= POPUP_LIMIT || y >= POPUP_HEIGHT {
+      return None;
+    }
+    let notice = self.popups().nth(row)?;
+    let target = if popup_close_hit(x, y) {
+      PopupTarget::Close
+    } else if let Some(index) = notice
+      .popup_actions()
+      .enumerate()
+      .find_map(|(index, _)| {
+        let (left, top, width, height) = popup_action_rect(index);
+        inside(Some((x.into(), y.into())), left, top, width, height).then_some(index)
+      })
+    {
+      PopupTarget::Action(index)
+    } else {
+      PopupTarget::Card
+    };
+    Some((row, target))
   }
 
   pub fn hovered_notice(&self) -> Option<u32> {
@@ -1366,14 +1398,8 @@ impl Model {
         return Some(Action::Close(notice.id));
       }
       for (index, (key, _)) in notice.popup_actions().enumerate() {
-        let left = POPUP_PADDING + index as i32 * (POPUP_ACTION_WIDTH + 8);
-        if inside(
-          Some((x.into(), y.into())),
-          left,
-          POPUP_ACTION_Y,
-          POPUP_ACTION_WIDTH,
-          22,
-        ) {
+        let (left, top, width, height) = popup_action_rect(index);
+        if inside(Some((x.into(), y.into())), left, top, width, height) {
           return Some(Action::Invoke(notice.id, key.clone()));
         }
       }
@@ -1715,9 +1741,26 @@ const SLIDER_X: i32 = PANEL_X + 135;
 const MONITOR_X: i32 = PANEL_X + PANEL_WIDTH - 40;
 const CLEAR_WIDTH: i32 = 80;
 const CLEAR_X: i32 = PANEL_X + PANEL_WIDTH - CLEAR_WIDTH - 12;
-const POPUP_ACTION_Y: i32 = 83;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PopupTarget {
+  Card,
+  Close,
+  Action(usize),
+}
+
+const POPUP_ACTION_Y: i32 = 98;
 const POPUP_ACTION_WIDTH: i32 = 104;
+const POPUP_ACTION_HEIGHT: i32 = 24;
 const POPUP_PADDING: i32 = 14;
+
+fn popup_action_rect(index: usize) -> (i32, i32, i32, i32) {
+  (
+    POPUP_PADDING + index as i32 * (POPUP_ACTION_WIDTH + 8),
+    POPUP_ACTION_Y,
+    POPUP_ACTION_WIDTH,
+    POPUP_ACTION_HEIGHT,
+  )
+}
 
 impl Notice {
   fn popup_text_x(&self) -> i32 {
@@ -2018,15 +2061,22 @@ fn dismissal(cr: &Context, x: i32, y: i32, hovered: bool) -> cairo::Result<()> {
     color(cr, 0xf38ba8, 0.20);
     cr.fill()?;
   }
-  color(cr, if hovered { 0xf38ba8 } else { 0xcdd6f4 }, 1.0);
+  if hovered {
+    color(cr, 0xf38ba8, 1.0);
+  } else {
+    color(cr, 0xa6adc8, 0.75);
+  }
   let x = f64::from(x + POPUP_CLOSE_SIZE / 2);
   let y = f64::from(y + POPUP_CLOSE_SIZE / 2);
+  cr.save()?;
   cr.set_line_width(1.5);
+  cr.set_line_cap(cairo::LineCap::Round);
   cr.move_to(x - 4.0, y - 4.0);
   cr.line_to(x + 4.0, y + 4.0);
   cr.move_to(x - 4.0, y + 4.0);
   cr.line_to(x + 4.0, y - 4.0);
-  cr.stroke()
+  cr.stroke()?;
+  cr.restore()
 }
 
 fn clock_text(seconds: f64) -> String {
@@ -2788,17 +2838,32 @@ fn lyric_layout(cr: &Context, text: &str) -> pango::Layout {
   })
 }
 
-fn paint_music_note(cr: &Context, x: f64, y: f64, scale: f64) -> cairo::Result<()> {
+fn paint_music_note(cr: &Context, x: f64, y: f64, size: f64) -> cairo::Result<()> {
+  use std::f64::consts::{FRAC_PI_2, PI};
   cr.save()?;
   cr.translate(x, y);
-  cr.scale(scale, scale);
-  cr.set_line_width(1.8);
-  cr.new_sub_path();
-  cr.arc(-2.5, 4.5, 3.3, 0.0, std::f64::consts::TAU);
-  cr.fill()?;
-  cr.move_to(0.4, 4.5);
-  cr.line_to(0.4, -7.5);
-  cr.curve_to(1.6, -5.2, 4.6, -5.2, 5.2, -1.8);
+  cr.scale(size / 24.0, size / 24.0);
+  cr.translate(-12.0, -12.0);
+  cr.set_line_width(1.5);
+  cr.set_line_cap(cairo::LineCap::Round);
+  cr.set_line_join(cairo::LineJoin::Round);
+  // Sonora's Iconoir music-2.svg:
+  // M12 16v3a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-1a2 2 0 0 1 2-2zm0 0V8m0 0V4l5-1v4z
+  cr.move_to(12.0, 16.0);
+  cr.line_to(12.0, 19.0);
+  cr.arc(10.0, 19.0, 2.0, 0.0, FRAC_PI_2);
+  cr.line_to(9.0, 21.0);
+  cr.arc(9.0, 19.0, 2.0, FRAC_PI_2, PI);
+  cr.line_to(7.0, 18.0);
+  cr.arc(9.0, 18.0, 2.0, PI, 1.5 * PI);
+  cr.close_path();
+  cr.move_to(12.0, 16.0);
+  cr.line_to(12.0, 8.0);
+  cr.move_to(12.0, 8.0);
+  cr.line_to(12.0, 4.0);
+  cr.line_to(17.0, 3.0);
+  cr.line_to(17.0, 7.0);
+  cr.close_path();
   cr.stroke()?;
   cr.restore()
 }
@@ -2822,14 +2887,14 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
       paint_music_note(
         cr,
         f64::from(LYRICS_LEFT + LYRICS_WIDTH / 2),
-        f64::from(center_y - 24),
-        1.7,
+        f64::from(center_y - 26),
+        44.0,
       )?;
       color(cr, 0xa6adc8, 1.0);
       label(
         cr,
         status,
-        (LYRICS_LEFT, center_y + 4, LYRICS_WIDTH),
+        (LYRICS_LEFT, center_y + 8, LYRICS_WIDTH),
         19,
         Weight::Normal,
         Alignment::Center,
@@ -2887,7 +2952,7 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
   );
   cr.clip();
   cr.push_group();
-  let fade_top = y < f64::from(LYRICS_TOP);
+  let fade_top = offset > 0 || y < f64::from(LYRICS_TOP);
   for (row_index, row) in rows.iter().copied().enumerate().skip(offset) {
     if y >= f64::from(LYRICS_BOTTOM) {
       break;
@@ -2907,7 +2972,7 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
     match row {
       LyricRow::Break { start, end } => {
         let center_x = f64::from(LYRICS_LEFT + LYRICS_WIDTH / 2);
-        let center_y = y + f64::from(height) / 2.0 - 4.0;
+        let center_y = y + 17.0;
         let past = elapsed >= end;
         let progress = active
           .map(|marker| f64::from(marker.break_progress) / 48.0)
@@ -2920,7 +2985,7 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
             let (r, g, b) = blend_color(0xcdd6f4, accent, note_progress);
             let alpha = 0.45 + 0.55 * note_progress;
             cr.set_source_rgba(r, g, b, alpha);
-            paint_music_note(cr, note_x, center_y, 1.45 + 0.12 * note_progress)?;
+            paint_music_note(cr, note_x, center_y, 30.0 + 2.5 * note_progress)?;
           } else {
             let alpha = if hovered || !follow {
               0.9
@@ -2930,7 +2995,7 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
               0.48
             };
             color(cr, 0xcdd6f4, alpha);
-            paint_music_note(cr, note_x, center_y, 1.45)?;
+            paint_music_note(cr, note_x, center_y, 30.0)?;
           }
         }
         if bottom > LYRICS_TOP {
@@ -3635,7 +3700,9 @@ pub fn paint(cr: &Context, model: &Model, layer: Layer) -> cairo::Result<()> {
   cr.paint()?;
   cr.set_operator(Operator::Over);
   if layer == Layer::Popup {
+    let pointer = model.popup_at_pointer();
     for (row, (notice, y)) in model.popups().zip(model.popup_rows()).enumerate() {
+      let target = pointer.filter(|(hovered, _)| *hovered == row).map(|(_, target)| target);
       cr.save()?;
       cr.translate(0.0, f64::from(y));
       paint_popup(
@@ -3643,9 +3710,11 @@ pub fn paint(cr: &Context, model: &Model, layer: Layer) -> cairo::Result<()> {
         model,
         notice,
         model.popup_close_hover == Some(notice.id),
-        model
-          .popup_at_pointer()
-          .is_some_and(|(hovered, _)| hovered == row),
+        target.is_some(),
+        match target {
+          Some(PopupTarget::Action(index)) => Some(index),
+          _ => None,
+        },
       )?;
       cr.restore()?;
     }
@@ -3663,84 +3732,94 @@ fn paint_popup(
   notice: &Notice,
   close_hovered: bool,
   hovered: bool,
+  hovered_action: Option<usize>,
 ) -> cairo::Result<()> {
   round(cr, 0, 0, POPUP_WIDTH, POPUP_HEIGHT, POPUP_RADIUS);
   color(cr, if hovered { 0x29283b } else { 0x1e1e2e }, model.opacity);
   cr.fill()?;
-  let width = POPUP_WIDTH - 2;
-  let height = POPUP_HEIGHT - 2;
-  let radius = POPUP_RADIUS - 1.0;
-  round(cr, 1, 1, width, height, radius);
-  color(cr, 0xcba6f7, 0.46);
+  let width = POPUP_WIDTH - 1;
+  let height = POPUP_HEIGHT - 1;
+  let radius = POPUP_RADIUS - 0.5;
+  cr.save()?;
+  cr.translate(0.5, 0.5);
+  round(cr, 0, 0, width, height, radius);
+  color(cr, 0xcba6f7, 0.25);
   cr.set_line_width(1.0);
   cr.stroke_preserve()?;
   if let Some(countdown) = &notice.countdown {
     let fraction = countdown.remaining().as_secs_f64() / countdown.duration.as_secs_f64();
     if fraction > 0.0 {
       let perimeter = f64::from(2 * (width + height)) - (8.0 - std::f64::consts::TAU) * radius;
-      cr.save()?;
+      cr.set_line_cap(cairo::LineCap::Round);
       cr.set_dash(&[perimeter * fraction.min(1.0), perimeter], 0.0);
-      color(cr, 0xcba6f7, 0.92);
+      color(cr, 0xcba6f7, 0.72);
       cr.stroke()?;
-      cr.restore()?;
     }
   }
+  cr.restore()?;
   cr.new_path();
   let text_x = notice.popup_text_x();
+  let header_width = POPUP_CLOSE_X - text_x - 8;
   if let Some(icon) = &notice.image {
     picture(cr, Some(icon), POPUP_PADDING, 14, 36, "")?;
   }
   let source = notice.source.as_deref();
-  color(cr, 0xcdd6f4, 1.0);
   let has_header = notice.image.is_some() || source.is_some();
+  let has_actions = notice.popup_actions().next().is_some();
+  color(cr, 0xf5f3ff, 1.0);
   label(
     cr,
     &notice.summary,
-    (text_x, 12, POPUP_WIDTH - text_x - 38),
-    16,
+    (text_x, 13, header_width),
+    15,
     Weight::Semibold,
     Alignment::Left,
   );
   dismissal(cr, POPUP_CLOSE_X, POPUP_CLOSE_Y, close_hovered)?;
   if let Some(source) = source {
-    color(cr, 0xa6adc8, 1.0);
+    color(cr, 0xa6adc8, 0.88);
     label(
       cr,
       source,
-      (text_x, 32, POPUP_WIDTH - text_x - 14),
-      11,
+      (text_x, 33, header_width),
+      12,
       Weight::Normal,
       Alignment::Left,
     );
   }
-  color(cr, 0xcdd6f4, 1.0);
+  color(cr, 0xbac2de, 1.0);
   label_lines(
     cr,
     &notice.body,
     (
       POPUP_PADDING,
-      if has_header { 51 } else { 36 },
+      if has_header { 56 } else { 36 },
       POPUP_WIDTH - 2 * POPUP_PADDING,
     ),
     13,
     Weight::Normal,
     Alignment::Left,
-    if notice.popup_actions().next().is_none() && !has_header {
-      3
-    } else {
-      2
+    match (has_header, has_actions) {
+      (true, true) => 2,
+      (false, false) => 4,
+      _ => 3,
     },
   );
   for (index, (_, action)) in notice.popup_actions().enumerate() {
-    let x = POPUP_PADDING + index as i32 * (POPUP_ACTION_WIDTH + 8);
-    color(cr, 0x45475a, 0.70);
-    round(cr, x, POPUP_ACTION_Y, POPUP_ACTION_WIDTH, 22, 6.0);
+    let (x, y, w, h) = popup_action_rect(index);
+    let action_hovered = hovered_action == Some(index);
+    if action_hovered {
+      color(cr, 0x585b70, 0.95);
+    } else {
+      color(cr, 0x45475a, 0.78);
+    }
+    round(cr, x, y, w, h, 6.0);
     cr.fill()?;
-    color(cr, 0xcdd6f4, 1.0);
+    color(cr, if action_hovered { 0xf5f3ff } else { 0xcdd6f4 }, 1.0);
     label(
       cr,
       action,
-      (x + 6, POPUP_ACTION_Y + 3, POPUP_ACTION_WIDTH - 12),
+      (x + 6, y + 4, w - 12),
       12,
       Weight::Semibold,
       Alignment::Center,
