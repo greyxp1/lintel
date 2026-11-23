@@ -878,7 +878,6 @@ pub fn search(query: &str) -> MediaResult<Vec<Song>> {
 
 #[derive(Default, Deserialize)]
 pub struct Lyrics {
-  pub source: String,
   pub lines: Vec<LyricLine>,
 }
 

@@ -634,6 +634,9 @@ impl Desktop {
       surface
         .surface
         .damage_buffer(x * scale, y * scale, w * scale, h * scale);
+      if model.lyric_scroll_animating() && surface.frame.is_none() {
+        surface.frame = Some(surface.surface.frame(qh, kind));
+      }
       surface.surface.commit();
       buffer.busy = true;
       buffer.damage = Damage::Clean;
@@ -759,7 +762,13 @@ impl Desktop {
     surface.surface.set_buffer_scale(scale);
     surface.surface.attach(Some(&buffer.handle), 0, 0);
     surface.surface.damage_buffer(0, 0, pixel_w, pixel_h);
-    if kind == Layer::Popup && model.timed_popups() && surface.frame.is_none() {
+    if surface.frame.is_none()
+      && match kind {
+        Layer::Popup => model.timed_popups(),
+        Layer::Bar => model.lyric_scroll_animating(),
+        _ => false,
+      }
+    {
       surface.frame = Some(surface.surface.frame(qh, kind));
     }
     surface.surface.commit();
@@ -916,12 +925,19 @@ impl Dispatch<wl_callback::WlCallback, Layer> for Desktop {
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
-    let animate = state.model.borrow().timed_popups();
+    let (animate, lyrics) = {
+      let model = state.model.borrow();
+      (model.timed_popups(), model.lyrics_view())
+    };
     if let Some(surface) = state.surface(*kind)
       && surface.frame.as_ref() == Some(callback)
     {
       surface.frame = None;
-      surface.dirty |= animate;
+      if *kind == Layer::Bar && lyrics {
+        surface.damage.add(ui::BarRegion::Lyrics);
+      } else if *kind == Layer::Popup {
+        surface.dirty |= animate;
+      }
     }
   }
 }

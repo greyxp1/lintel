@@ -27,8 +27,8 @@ const BUTTON_WIDTH: i32 = 40;
 const PLAYER_X: i32 = MUSIC_PANEL_X + 340;
 const PLAYER_WIDTH: i32 = MUSIC_PANEL_WIDTH - 340;
 const TRANSPORT_X: i32 = PLAYER_X + (PLAYER_WIDTH - 3 * BUTTON_WIDTH) / 2;
-const SEEK_Y: i32 = 288;
-const TRANSPORT_Y: i32 = 307;
+const SEEK_Y: i32 = 294;
+const TRANSPORT_Y: i32 = 313;
 const TAB_Y: i32 = PANEL_Y + 17;
 const TAB_START: i32 = MUSIC_LEFT - 4;
 const TAB_WIDTH: i32 = 28;
@@ -37,7 +37,11 @@ const MUSIC_TAB_HEIGHT: i32 = 32;
 const SAVE_WIDTH: i32 = 55;
 const SAVE_X: i32 = PLAYER_X - SAVE_WIDTH - 12;
 const LIST_Y: i32 = PANEL_Y + 60;
-const TAB_END: i32 = TRANSPORT_END;
+const MUSIC_BOTTOM: i32 = TRANSPORT_END + 82;
+const TAB_END: i32 = MUSIC_BOTTOM - 12;
+const SEARCH_END: i32 = TAB_END - 22;
+const MUSIC_GAIN_START: i32 = PLAYER_X + 42;
+const MUSIC_GAIN_END: i32 = PLAYER_X + PLAYER_WIDTH - 56;
 const LYRICS_SHIFT: i32 = 174;
 const LYRICS_LEFT: i32 = MUSIC_LEFT + 12;
 const LYRICS_WIDTH: i32 = WIDTH - 2 * LYRICS_LEFT;
@@ -45,17 +49,18 @@ const LYRICS_TOP: i32 = LIST_Y + 20;
 const LYRICS_BOTTOM: i32 = 447;
 const RESULTS_Y: i32 = LIST_Y + 41;
 const RESULTS_ROW: i32 = 46;
-const SEARCH_ROWS: usize = 5;
+const SEARCH_ROWS: usize = ((SEARCH_END - RESULTS_Y) / RESULTS_ROW) as usize;
 const QUEUE_ROW: i32 = 42;
 const PLAYLIST_ROW: i32 = 42;
+const PLAYLIST_ROWS: usize = ((TAB_END - LIST_Y) / PLAYLIST_ROW) as usize;
+const QUEUE_ROWS: usize = ((TAB_END - LIST_Y) / QUEUE_ROW) as usize;
 const TRANSPORT_END: i32 = PANEL_Y + TRANSPORT_Y + 30;
 pub const CORNER_SIZE: i32 = 20;
 pub const PANEL_WIDTH: i32 = HEADER_WIDTH - 2 * WING;
 const PANEL_X: i32 = (WIDTH - PANEL_WIDTH) / 2;
 const PANEL_Y: i32 = HEIGHT;
 const COVER: i32 = 184;
-const MUSIC_GAIN_TOP: i32 = PANEL_Y + 63;
-const MUSIC_GAIN_BOTTOM: i32 = PANEL_Y + COVER - 2;
+
 const ROW_HEIGHT: i32 = 40;
 const VISIBLE_ROWS: usize = 6;
 pub const POPUP_WIDTH: i32 = 340;
@@ -195,7 +200,7 @@ pub struct LyricMarker {
   index: usize,
   word_end: u32,
   word_progress: u8,
-  scroll_progress: u8,
+  scroll_progress: u16,
   singing: bool,
 }
 
@@ -296,9 +301,9 @@ impl Slider {
     }
   }
 
-  pub fn position(self, x: i32, y: i32) -> u8 {
+  pub fn position(self, x: i32, _y: i32) -> u8 {
     if matches!(self, Self::Music(_) | Self::MusicLevel(..)) {
-      return ((MUSIC_GAIN_BOTTOM - y) * 100 / (MUSIC_GAIN_BOTTOM - MUSIC_GAIN_TOP)).clamp(0, 100)
+      return ((x - MUSIC_GAIN_START) * 100 / (MUSIC_GAIN_END - MUSIC_GAIN_START)).clamp(0, 100)
         as u8;
     }
     ((x - self.start()) * 100 / (SLIDER_END - self.start())).clamp(0, 100) as u8
@@ -490,9 +495,9 @@ impl Model {
             && self.confirmation.is_none() =>
         {
           if index == MusicChannel::Listen as usize {
-            music_headphones_hit(pointer)
+            music_gain_icon_hit(pointer, MusicChannel::Listen)
           } else {
-            self.music_mix && music_mic_hit(pointer)
+            self.music_mix && music_gain_icon_hit(pointer, MusicChannel::Send)
           }
         }
         _ => false,
@@ -584,11 +589,11 @@ impl Model {
       }
     });
     let scroll_progress = if !self.lyrics_scrolled && self.track.progressing_since.is_some() {
-      line.start.map_or(16, |start| {
-        (((elapsed - start) / 0.28) * 16.0).clamp(0.0, 16.0) as u8
+      line.start.map_or(1024, |start| {
+        (((elapsed - start) / 0.28) * 1024.0).clamp(0.0, 1024.0) as u16
       })
     } else {
-      16
+      1024
     };
     Some(LyricMarker {
       index,
@@ -609,6 +614,12 @@ impl Model {
         .iter()
         .any(|&(_, _, time)| time == start))
     .then_some(marker)
+  }
+
+  pub fn lyric_scroll_animating(&self) -> bool {
+    self.lyric_marker().is_some_and(|marker| {
+      marker.index > 0 && marker.scroll_progress < 1024 && !self.lyrics_scrolled
+    })
   }
 
   fn music_stream(&self) -> Option<&Stream> {
@@ -874,7 +885,8 @@ impl Model {
             0
           }
       }
-      Panel::Music => TRANSPORT_END + 16 + self.player_shift(),
+      Panel::Music if self.lyrics_view() => TRANSPORT_END + 16 + self.player_shift(),
+      Panel::Music => MUSIC_BOTTOM,
       Panel::Audio => {
         let count = self.count().min(VISIBLE_ROWS) as i32;
         PANEL_Y
@@ -917,12 +929,12 @@ impl Model {
       .playlists
       .iter()
       .skip(self.list_offset())
-      .take(VISIBLE_ROWS)
+      .take(PLAYLIST_ROWS + 1)
   }
 
   fn visible_queue(&self) -> impl Iterator<Item = (usize, &QueueSong)> {
     let first = self.track.queue_index + 1 + self.list_offset();
-    let end = self.track.queue_songs.len().min(first + VISIBLE_ROWS);
+    let end = self.track.queue_songs.len().min(first + QUEUE_ROWS + 1);
     (first..end).map(|row| {
       let index = self
         .queue_drag
@@ -944,7 +956,7 @@ impl Model {
       .search_results
       .iter()
       .skip(self.list_offset())
-      .take(SEARCH_ROWS)
+      .take(SEARCH_ROWS + 1)
   }
 
   pub fn visible_cover_urls(&self) -> Vec<&str> {
@@ -960,7 +972,7 @@ impl Model {
       MusicTab::Search if self.playlist_target.is_some() => self
         .playlist_targets()
         .skip(self.list_offset())
-        .take(SEARCH_ROWS)
+        .take(SEARCH_ROWS + 1)
         .map(|list| list.art.as_str())
         .collect(),
       MusicTab::Search => self
@@ -1007,8 +1019,13 @@ impl Model {
   }
 
   fn visible_list_rows(&self) -> usize {
-    if self.panel == Panel::Music && self.music_tab == MusicTab::Search {
-      SEARCH_ROWS
+    if self.panel == Panel::Music {
+      match self.music_tab {
+        MusicTab::Playlists => PLAYLIST_ROWS,
+        MusicTab::Queue => QUEUE_ROWS,
+        MusicTab::Search => SEARCH_ROWS,
+        MusicTab::Lyrics => 1,
+      }
     } else {
       VISIBLE_ROWS
     }
@@ -1178,7 +1195,7 @@ impl Model {
       if start <= end {
         let row = (y - LIST_Y)
           .div_euclid(QUEUE_ROW)
-          .clamp(0, VISIBLE_ROWS as i32 - 1);
+          .clamp(0, (TAB_END - LIST_Y - 1) / QUEUE_ROW);
         let next = (start + offset + row as usize).min(end);
         return std::mem::replace(&mut drag.to, next) != next;
       }
@@ -1318,24 +1335,24 @@ impl Model {
         && !self.lyrics_view()
         && self.music_mix
         && !right
-        && music_mic_hit(Some((x.into(), y.into())))
+        && music_gain_icon_hit(Some((x.into(), y.into())), MusicChannel::Send)
       {
         return Some(Action::ToggleMic);
       }
       if self.signed_in
         && !self.lyrics_view()
         && !right
-        && music_headphones_hit(Some((x.into(), y.into())))
+        && music_gain_icon_hit(Some((x.into(), y.into())), MusicChannel::Listen)
         && let Some((slider, _)) = self.music_slider(MusicChannel::Listen)
       {
         return Some(Action::Volume(slider, None));
       }
       if self.signed_in
         && !self.lyrics_view()
-        && (MUSIC_GAIN_TOP - 8..=MUSIC_GAIN_BOTTOM + 8).contains(&y)
+        && (MUSIC_GAIN_START - 5..=MUSIC_GAIN_END + 5).contains(&x)
       {
         for channel in MusicChannel::ALL {
-          if (x - music_gain_x(channel)).abs() <= 12
+          if (y - music_gain_y(channel)).abs() <= 11
             && let Some((slider, _)) = self.music_slider(channel)
           {
             return Some(Action::Volume(
@@ -1446,11 +1463,11 @@ impl Model {
         }
         return None;
       }
-      if x < PLAYER_X && (LIST_Y..TAB_END).contains(&y) {
+      if (MUSIC_LEFT - 4..PLAYER_X).contains(&x) && (LIST_Y..TAB_END).contains(&y) {
         match self.music_tab {
           MusicTab::Playlists if !self.playlist_busy => {
             let row = ((y - LIST_Y) / PLAYLIST_ROW) as usize;
-            if row < VISIBLE_ROWS {
+            if row <= PLAYLIST_ROWS {
               return self
                 .playlists
                 .get(self.list_offset() + row)
@@ -1467,7 +1484,7 @@ impl Model {
           MusicTab::Queue => {
             let row = ((y - LIST_Y) / QUEUE_ROW) as usize;
             let index = self.track.queue_index + 1 + self.list_offset() + row;
-            if row < VISIBLE_ROWS
+            if row <= QUEUE_ROWS
               && index < self.track.queue.len()
               && !self.queue_drag.as_ref().is_some_and(|drag| drag.submitted)
             {
@@ -1485,9 +1502,7 @@ impl Model {
               self.dismiss_confirmation();
               return Some(Action::SmallCovers);
             }
-            if !self.adding_song
-              && (RESULTS_Y..RESULTS_Y + RESULTS_ROW * SEARCH_ROWS as i32).contains(&y)
-            {
+            if !self.adding_song && (RESULTS_Y..SEARCH_END).contains(&y) {
               let row = ((y - RESULTS_Y) / RESULTS_ROW) as usize;
               let playlist = self
                 .playlist_targets()
@@ -1497,9 +1512,7 @@ impl Model {
               return Some(Action::AddSong(playlist, song));
             }
           }
-          MusicTab::Search
-            if (RESULTS_Y..RESULTS_Y + RESULTS_ROW * SEARCH_ROWS as i32).contains(&y) =>
-          {
+          MusicTab::Search if (RESULTS_Y..SEARCH_END).contains(&y) => {
             let row = ((y - RESULTS_Y) / RESULTS_ROW) as usize;
             let song = self.search_results.get(self.list_offset() + row)?.clone();
             if inside(
@@ -1618,32 +1631,12 @@ fn audio_slider_y(index: usize) -> i32 {
   PANEL_Y + 43 + index as i32 * 35
 }
 
-fn music_gain_x(channel: MusicChannel) -> i32 {
-  let margin = (PLAYER_WIDTH - COVER) / 4;
-  match channel {
-    MusicChannel::Listen => PLAYER_X + margin,
-    MusicChannel::Send => PLAYER_X + PLAYER_WIDTH - margin,
-  }
+fn music_gain_y(channel: MusicChannel) -> i32 {
+  TRANSPORT_END + 16 + channel as i32 * 29
 }
 
-fn music_mic_hit(pointer: Option<(f64, f64)>) -> bool {
-  inside(
-    pointer,
-    music_gain_x(MusicChannel::Send) - 12,
-    MUSIC_GAIN_TOP - 28,
-    24,
-    24,
-  )
-}
-
-fn music_headphones_hit(pointer: Option<(f64, f64)>) -> bool {
-  inside(
-    pointer,
-    music_gain_x(MusicChannel::Listen) - 12,
-    MUSIC_GAIN_TOP - 28,
-    24,
-    24,
-  )
+fn music_gain_icon_hit(pointer: Option<(f64, f64)>, channel: MusicChannel) -> bool {
+  inside(pointer, PLAYER_X + 10, music_gain_y(channel) - 13, 26, 26)
 }
 
 fn audio_button_hit(pointer: Option<(f64, f64)>, index: usize) -> bool {
@@ -2054,44 +2047,13 @@ fn transport(cr: &Context, model: &Model) -> cairo::Result<()> {
   Ok(())
 }
 
-fn tab_symbol(cr: &Context, tab: MusicTab, x: i32, y: i32) -> cairo::Result<()> {
-  let x = f64::from(x);
-  let y = f64::from(y);
+fn search_symbol(cr: &Context, x: i32, y: i32) -> cairo::Result<()> {
+  let (x, y) = (f64::from(x), f64::from(y));
   cr.set_line_width(1.45);
-  match tab {
-    MusicTab::Playlists => {
-      round(cr, x as i32 - 7, y as i32 - 4, 14, 10, 2.0);
-      cr.move_to(x - 5.0, y - 7.0);
-      cr.rel_line_to(10.0, 0.0);
-      cr.move_to(x - 2.0, y - 2.0);
-      cr.rel_line_to(0.0, 6.0);
-      cr.rel_line_to(5.0, -3.0);
-      cr.close_path();
-    }
-    MusicTab::Queue => {
-      for dy in [-5.0, 0.0, 5.0] {
-        cr.move_to(x - 7.0, y + dy);
-        cr.rel_line_to(1.5, 0.0);
-        cr.move_to(x - 2.0, y + dy);
-        cr.rel_line_to(8.0, 0.0);
-      }
-    }
-    MusicTab::Lyrics => {
-      for dx in [-6.0, 1.0] {
-        cr.move_to(x + dx + 4.0, y - 5.0);
-        cr.curve_to(x + dx, y - 4.0, x + dx, y, x + dx, y + 2.0);
-        cr.rel_line_to(4.0, 0.0);
-        cr.rel_line_to(0.0, -4.0);
-        cr.rel_line_to(-3.0, 0.0);
-      }
-    }
-    MusicTab::Search => {
-      cr.new_sub_path();
-      cr.arc(x - 1.5, y - 1.5, 4.4, 0.0, std::f64::consts::TAU);
-      cr.move_to(x + 2.0, y + 2.0);
-      cr.line_to(x + 6.5, y + 6.5);
-    }
-  }
+  cr.new_sub_path();
+  cr.arc(x - 1.5, y - 1.5, 4.4, 0.0, std::f64::consts::TAU);
+  cr.move_to(x + 2.0, y + 2.0);
+  cr.line_to(x + 6.5, y + 6.5);
   cr.stroke()
 }
 
@@ -2133,19 +2095,18 @@ fn paint_search_field(cr: &Context, model: &Model, left: i32, width: i32) -> cai
   }
   cr.restore()?;
   color(cr, 0xcdd6f4, 1.0);
-  tab_symbol(cr, MusicTab::Search, PLAYER_X - 20, LIST_Y + 15)?;
+  search_symbol(cr, PLAYER_X - 20, LIST_Y + 15)?;
   Ok(())
 }
 
 fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<()> {
   let width = PLAYER_X - left - 8;
-  for (index, (tab, name)) in MUSIC_TABS
+  for (index, name) in ["Playlists", "Queue", "Lyrics", "Search"]
     .into_iter()
-    .zip(["Playlists", "Queue", "Lyrics", "Search"])
     .enumerate()
   {
     let x = TAB_START + index as i32 * MUSIC_TAB_WIDTH;
-    let selected = model.music_tab == tab;
+    let selected = model.music_tab == MUSIC_TABS[index];
     let hovered = inside(
       model.bar_pointer,
       x,
@@ -2159,17 +2120,36 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
       cr.fill()?;
     }
     color(cr, if selected { 0xcba6f7 } else { 0xcdd6f4 }, 1.0);
-    tab_symbol(cr, tab, x + 13, TAB_Y + 15)?;
     label(
       cr,
       name,
-      (x + 24, TAB_Y + 8, MUSIC_TAB_WIDTH - 22),
-      12,
+      (x + 4, TAB_Y + 7, MUSIC_TAB_WIDTH - 8),
+      13,
       Weight::Semibold,
-      Alignment::Left,
+      Alignment::Center,
     );
   }
 
+  if model.lyrics_view() {
+    return paint_lyrics(cr, model);
+  }
+  let bottom = if model.music_tab == MusicTab::Search {
+    SEARCH_END
+  } else {
+    TAB_END
+  };
+  let fade = model.count() > model.list_offset() + model.visible_list_rows();
+  cr.save()?;
+  cr.rectangle(
+    f64::from(left - 4),
+    f64::from(LIST_Y),
+    f64::from(PLAYER_X - left + 4),
+    f64::from(bottom - LIST_Y),
+  );
+  cr.clip();
+  if fade {
+    cr.push_group();
+  }
   match model.music_tab {
     MusicTab::Playlists => {
       if model.playlists.is_empty() && !model.playlist_busy {
@@ -2249,7 +2229,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
         );
       }
     }
-    MusicTab::Lyrics => paint_lyrics(cr, model)?,
+    MusicTab::Lyrics => unreachable!(),
     MusicTab::Search if let Some(target) = &model.playlist_target => {
       let hovered = inside(model.bar_pointer, left - 4, LIST_Y, width + 4, 32);
       round(cr, left - 4, LIST_Y, width + 4, 32, 7.0);
@@ -2276,7 +2256,7 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
       for (row, list) in model
         .playlist_targets()
         .skip(model.list_offset())
-        .take(SEARCH_ROWS)
+        .take(SEARCH_ROWS + 1)
         .enumerate()
       {
         let y = RESULTS_Y + row as i32 * RESULTS_ROW;
@@ -2389,21 +2369,31 @@ fn paint_music_library(cr: &Context, model: &Model, left: i32) -> cairo::Result<
           Alignment::Center,
         );
       }
-      if let Some(feedback) = model.add_feedback.as_deref().or_else(|| {
-        model
-          .search_row
-          .map(|_| "↑↓ Select   Enter Play   Ctrl+Enter Add")
-      }) {
-        color(cr, 0xcba6f7, 1.0);
-        label(
-          cr,
-          feedback,
-          (left, TAB_END - 2, width),
-          12,
-          Weight::Semibold,
-          Alignment::Left,
-        );
-      }
+    }
+  }
+  if fade {
+    cr.pop_group_to_source()?;
+    let mask = cairo::LinearGradient::new(0.0, f64::from(bottom - 34), 0.0, f64::from(bottom));
+    mask.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 1.0);
+    mask.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.0);
+    cr.mask(&mask)?;
+  }
+  cr.restore()?;
+  if model.music_tab == MusicTab::Search && model.playlist_target.is_none() {
+    if let Some(feedback) = model.add_feedback.as_deref().or_else(|| {
+      model
+        .search_row
+        .map(|_| "↑↓ Select   Enter Play   Ctrl+Enter Add")
+    }) {
+      color(cr, 0xcba6f7, 1.0);
+      label(
+        cr,
+        feedback,
+        (left, SEARCH_END + 4, width),
+        12,
+        Weight::Semibold,
+        Alignment::Left,
+      );
     }
   }
   Ok(())
@@ -2461,10 +2451,10 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
       };
       let previous = marker.index - 1;
       let previous_height = height(previous);
-      let t = f64::from(marker.scroll_progress) / 16.0;
+      let t = f64::from(marker.scroll_progress) / 1024.0;
       let remaining = 1.0 - t * t * (3.0 - 2.0 * t);
       let y = anchor - previous_height + (remaining * f64::from(previous_height)).round() as i32;
-      if previous > 0 && marker.scroll_progress < 16 {
+      if previous > 0 && marker.scroll_progress < 1024 {
         (previous - 1, y - height(previous - 1))
       } else {
         (previous, y)
@@ -2564,22 +2554,6 @@ fn paint_lyrics(cr: &Context, model: &Model) -> cairo::Result<()> {
     y += height;
   }
   cr.restore()?;
-  let timing = if model.lyrics.lines.iter().any(|line| !line.words.is_empty()) {
-    "Word sync"
-  } else if marker.is_some() {
-    "Line sync"
-  } else {
-    "Unsynced"
-  };
-  color(cr, 0xa6adc8, 1.0);
-  label(
-    cr,
-    &format!("{timing}  /  {}", model.lyrics.source),
-    (LYRICS_LEFT, LYRICS_BOTTOM + 8, LYRICS_WIDTH),
-    11,
-    Weight::Normal,
-    Alignment::Left,
-  );
   Ok(())
 }
 
@@ -2617,8 +2591,8 @@ fn paint_audio_device(cr: &Context, x: f64, y: f64, device: Device) -> cairo::Re
 }
 
 fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo::Result<()> {
-  let x = music_gain_x(channel);
-  let icon_y = MUSIC_GAIN_TOP - 16;
+  let x = PLAYER_X + 23;
+  let icon_y = music_gain_y(channel);
   let level = model.music_slider(channel);
   if level.is_none() && (channel == MusicChannel::Listen || !model.music_mix) {
     return Ok(());
@@ -2661,20 +2635,20 @@ fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo
     return Ok(());
   };
   let volume = model.volume(slider, Some(volume)).unwrap_or(volume);
-  let height = MUSIC_GAIN_BOTTOM - MUSIC_GAIN_TOP;
+  let width = MUSIC_GAIN_END - MUSIC_GAIN_START;
   color(cr, 0x45475a, 1.0);
-  round(cr, x - 3, MUSIC_GAIN_TOP, 6, height, 3.0);
+  round(cr, MUSIC_GAIN_START, icon_y - 2, width, 4, 2.0);
   cr.fill()?;
-  let filled = height * i32::from(volume.percent.min(100)) / 100;
+  let filled = width * i32::from(volume.percent.min(100)) / 100;
   if filled > 0 {
     color(cr, if volume.muted { 0x6c7086 } else { 0xcba6f7 }, 1.0);
     round(
       cr,
-      x - 3,
-      MUSIC_GAIN_BOTTOM - filled,
-      6,
+      MUSIC_GAIN_START,
+      icon_y - 2,
       filled,
-      3.0_f64.min(f64::from(filled) / 2.0),
+      4,
+      2.0_f64.min(f64::from(filled) / 2.0),
     );
     cr.fill()?;
   }
@@ -2687,10 +2661,10 @@ fn paint_music_gain(cr: &Context, model: &Model, channel: MusicChannel) -> cairo
   label(
     cr,
     &value,
-    (x, MUSIC_GAIN_BOTTOM + 6, 0),
+    (MUSIC_GAIN_END + 6, icon_y - 7, 39),
     10,
     Weight::Normal,
-    Alignment::Center,
+    Alignment::Right,
   );
   Ok(())
 }
@@ -2900,23 +2874,24 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       "♪",
     )?;
     color(cr, 0xcdd6f4, 1.0);
-    label(
+    label_lines(
       cr,
       if title.is_empty() {
         "Nothing playing"
       } else {
         title
       },
-      (PLAYER_X, PANEL_Y + 216, PLAYER_WIDTH - 5),
+      (PLAYER_X + 12, PANEL_Y + 212, PLAYER_WIDTH - 24),
       15,
       Weight::Semibold,
       Alignment::Center,
+      2,
     );
     color(cr, 0xa6adc8, 1.0);
     label(
       cr,
       artist,
-      (PLAYER_X, PANEL_Y + 236, PLAYER_WIDTH - 5),
+      (PLAYER_X + 12, PANEL_Y + 247, PLAYER_WIDTH - 24),
       12,
       Weight::Normal,
       Alignment::Center,
@@ -2926,7 +2901,7 @@ fn paint_panel(cr: &Context, model: &Model) -> cairo::Result<()> {
       label(
         cr,
         status,
-        (PLAYER_X + 8, PANEL_Y + 252, PLAYER_WIDTH - 18),
+        (PLAYER_X + 8, PANEL_Y + 259, PLAYER_WIDTH - 18),
         11,
         Weight::Normal,
         Alignment::Center,
