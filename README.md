@@ -1,12 +1,12 @@
 # Lintel
 
-A native Wayland shell for Niri with an edge-attached bar, notification history,
-a tray and wallpaper rendering from [greyxp1/rustbg](https://github.com/greyxp1/rustbg).
+A native Wayland shell for Niri with an edge-attached bar, notification history
+and a tray.
 
 Run it in a Wayland session with an available notification and tray bus name.
 
 ```sh
-nix run . -- --wallpaper /path/to/image.jpg --backdrop-blur 7
+nix run .
 nix run . -- player
 ```
 

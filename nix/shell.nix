@@ -2,7 +2,6 @@
   cairo,
   callPackage,
   curl,
-  ffmpeg-headless,
   gh,
   glib,
   lib,
@@ -21,23 +20,18 @@
   player = callPackage ./ytmd.nix {};
   python = python3.withPackages (ps: [ps.ytmusicapi]);
   library = writeShellScriptBin "lintel-ytmusic" ''
-    exec ${python}/bin/python ${../shell/music.py} "$@"
+    exec ${python}/bin/python ${../music.py} "$@"
   '';
 in
   rustPlatform.buildRustPackage {
     pname = "lintel";
     version = "0.1.0";
     src = lib.cleanSource ../.;
-    cargoRoot = "shell";
-    buildAndTestSubdir = "shell";
-    cargoLock = {
-      lockFile = ../shell/Cargo.lock;
-      outputHashes."wllib-0.1.0" = "sha256-E6gAnb+I5GQdOpkGlXVIllsnvTbn3eSP4pzVFoDGYHM=";
-    };
+    cargoLock.lockFile = ../Cargo.lock;
     nativeBuildInputs = [makeWrapper pkg-config];
     buildInputs = [cairo glib pango libxkbcommon];
     postFixup = ''
-      wrapProgram "$out/bin/lintel" --prefix PATH : "${lib.makeBinPath [curl ffmpeg-headless gh library player pipewire pulseaudio wireplumber xdg-utils]}"
+      wrapProgram "$out/bin/lintel" --prefix PATH : "${lib.makeBinPath [curl gh library player pipewire pulseaudio wireplumber xdg-utils]}"
     '';
     meta.mainProgram = "lintel";
   }

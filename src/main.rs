@@ -6,8 +6,6 @@ mod ui;
 mod wayland;
 
 use std::cell::{Cell, RefCell};
-use std::ffi::{CString, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -25,7 +23,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const HELP: &str = "Wayland desktop shell
 
-Usage: lintel --wallpaper IMAGE [OPTIONS]
+Usage: lintel [OPTIONS]
        lintel player [YTM ARGUMENTS]
        lintel music [LIBRARY ARGUMENTS]
        lintel toggle-audio
@@ -33,8 +31,6 @@ Usage: lintel --wallpaper IMAGE [OPTIONS]
        lintel toggle-picker NAMESPACE COMMAND [ARGS]
 
 Options:
-  --wallpaper IMAGE       Wallpaper image
-  --backdrop-blur SIGMA   Create a blurred backdrop (0–1024 pixels)
   --playlist NAME=ID     Pin a YouTube Music playlist (repeatable)
   -h, --help             Show help";
 
@@ -80,8 +76,6 @@ fn run() -> Result<()> {
   if args.peek().is_some_and(|arg| arg == "toggle-picker") {
     return toggle_picker(args.skip(1));
   }
-  let mut wallpaper = None;
-  let mut blur = None;
   let mut pinned = Vec::new();
   while let Some(arg) = args.next() {
     match arg.as_str() {
@@ -89,25 +83,12 @@ fn run() -> Result<()> {
         println!("{HELP}");
         return Ok(());
       }
-      "--wallpaper" => wallpaper = Some(args.next().ok_or("missing wallpaper image")?),
-      "--backdrop-blur" => blur = Some(args.next().ok_or("missing blur amount")?.parse::<u32>()?),
       "--playlist" => pinned.push(media::Playlist::pin(
         &args.next().ok_or("missing playlist")?,
       )?),
       _ => return Err(format!("unknown argument {arg}. See lintel --help.").into()),
     }
   }
-  let image = wallpaper.ok_or("--wallpaper IMAGE is required")?;
-  if !Path::new(&image).is_file() {
-    return Err(format!("wallpaper image is missing or unreadable: {image}").into());
-  }
-  let wallpaper =
-    rustbg::Config::new(&image, "rustbg-wallpaper", 0).ok_or("invalid wallpaper path")?;
-  let backdrop = blur
-    .map(|strength| {
-      rustbg::Config::new(&image, "rustbg-backdrop", strength).ok_or("invalid backdrop blur amount")
-    })
-    .transpose()?;
 
   let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is required")?;
   let main_loop = MainLoop::new(None, false);
@@ -133,13 +114,6 @@ fn run() -> Result<()> {
   let refresh: Rc<dyn Fn()> = Rc::new(move || target.draw(true));
   let services = Services::connect(model.clone(), refresh.clone())?;
   github::watch(services.clone());
-  initialize_wallpaper_environment();
-  for config in std::iter::once(wallpaper).chain(backdrop) {
-    thread::Builder::new()
-      .name("wallpaper".into())
-      .stack_size(512 * 1024)
-      .spawn(move || rustbg::run(config))?;
-  }
 
   let socket = Path::new(&runtime).join("yt-music-player/ytmd.sock");
   let (router, route_updates, route_worker) = audio::route_worker();
@@ -1527,18 +1501,4 @@ fn refresh_active(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>, socket: &P
       }
     },
   );
-}
-
-fn initialize_wallpaper_environment() {
-  let mut envp = Vec::new();
-  for (mut key, value) in std::env::vars_os() {
-    key.push(OsString::from("="));
-    key.push(value);
-    if let Ok(entry) = CString::new(key.as_os_str().as_bytes()) {
-      envp.push(entry.into_raw().cast_const());
-    }
-  }
-  envp.push(std::ptr::null());
-  // The fork uses this immutable environment for Wayland and its FFmpeg children.
-  unsafe { rustbg::set_envp(Box::leak(envp.into_boxed_slice()).as_ptr()) };
 }

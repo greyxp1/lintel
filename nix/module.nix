@@ -15,15 +15,6 @@ in {
       default = null;
       extraDescription = "The package built by the desktop shell repository.";
     };
-    wallpaper = lib.mkOption {
-      type = lib.types.path;
-      description = "Static wallpaper image.";
-    };
-    backdropBlur = lib.mkOption {
-      type = lib.types.nullOr (lib.types.ints.between 0 1024);
-      default = null;
-      description = "Blur radius for a separate backdrop. Null creates no backdrop.";
-    };
     playlists = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = {};
@@ -41,8 +32,7 @@ in {
       enableDefaultPath = false;
       serviceConfig = {
         ExecStart = utils.escapeSystemdExecArgs (
-          [ (lib.getExe cfg.package) "--wallpaper" "${cfg.wallpaper}" ]
-          ++ lib.optionals (cfg.backdropBlur != null) ["--backdrop-blur" (toString cfg.backdropBlur)]
+          [(lib.getExe cfg.package)]
           ++ lib.concatLists (lib.mapAttrsToList (name: id: ["--playlist" "${name}=${id}"]) cfg.playlists)
         );
         Restart = "on-failure";
