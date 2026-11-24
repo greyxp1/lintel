@@ -183,7 +183,6 @@ pub struct Desktop {
   xy: (f64, f64),
   model: Rc<RefCell<Model>>,
   actions: Vec<Action>,
-  closed: bool,
 }
 
 impl Desktop {
@@ -221,16 +220,57 @@ impl Desktop {
       xy: (0.0, 0.0),
       model,
       actions: Vec::new(),
-      closed: false,
     };
-    desktop.bar = Some(desktop.create(Layer::Bar, (WIDTH, ui::REVEAL_HEIGHT), None));
     for global in globals.contents().clone_list() {
       if global.interface == "wl_output" {
         desktop.add_output(globals.registry(), global.name, global.version);
       }
     }
+    desktop.ensure_bar();
     desktop.flush()?;
     Ok(desktop)
+  }
+
+  // The compositor closes the bar with its output, and a layer surface needs an output to exist.
+  fn ensure_bar(&mut self) {
+    if self.bar.is_none() && !self.outputs.is_empty() {
+      self.bar = Some(self.create(Layer::Bar, (WIDTH, ui::REVEAL_HEIGHT), None));
+    }
+  }
+
+  fn close_bar(&mut self) {
+    self.bar = None;
+    self.bar_on_demand = false;
+    self.bar_overlay = false;
+    self.repeated_key = None;
+    if std::mem::take(&mut self.bar_keyboard_focus) {
+      self.actions.push(Action::BarFocusLost);
+    }
+    if self.target == Some(Layer::Bar) {
+      self.target = None;
+    }
+    self.model.borrow_mut().bar_closed();
+  }
+
+  fn close_popup(&mut self) {
+    self.popup = None;
+    if self.target == Some(Layer::Popup) {
+      self.target = None;
+      if self.model.borrow_mut().hover_popup(None) {
+        self.actions.push(Action::PopupHover);
+      }
+    }
+  }
+
+  // Events can still name a surface this client already replaced.
+  fn current(&self, surface: &wl_surface::WlSurface) -> Option<Layer> {
+    let kind = *surface.data::<Layer>()?;
+    let current = match kind {
+      Layer::Bar => self.bar.as_ref(),
+      Layer::Popup => self.popup.as_ref(),
+      Layer::Corner(name, corner) => self.corners.get(&(name, corner)),
+    }?;
+    (current.surface == *surface).then_some(kind)
   }
 
   fn add_output(&mut self, registry: &wl_registry::WlRegistry, name: u32, version: u32) {
@@ -330,9 +370,6 @@ impl Desktop {
       queue.dispatch_pending(self)?;
     }
     self.queue = Some(queue);
-    if self.closed {
-      return Err("Wayland bar closed".into());
-    }
     Ok(std::mem::take(&mut self.actions))
   }
 
@@ -365,9 +402,14 @@ impl Desktop {
   }
 
   pub fn draw_pending(&mut self) -> Result<bool> {
+    self.ensure_bar();
     self.update_search_focus();
-    let model = self.model.borrow();
-    let popup_height = model.popup_rows().last().map(|y| y + POPUP_HEIGHT);
+    let popup_height = self
+      .model
+      .borrow()
+      .popup_rows()
+      .last()
+      .map(|y| y + POPUP_HEIGHT);
     if let Some(height) = popup_height {
       let wanted = (POPUP_WIDTH, height);
       if let Some(popup) = &mut self.popup {
@@ -376,12 +418,13 @@ impl Desktop {
           popup.surface.commit();
           popup.requested = wanted;
         }
-      } else {
+      } else if !self.outputs.is_empty() {
         self.popup = Some(self.create(Layer::Popup, wanted, None));
       }
-    } else {
-      self.popup = None;
+    } else if self.popup.is_some() {
+      self.close_popup();
     }
+    let model = self.model.borrow();
     if let Some(bar) = &mut self.bar {
       let mut commit = false;
       let on_demand = model.panel != ui::Panel::None;
@@ -892,14 +935,16 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Desktop {
 impl Dispatch<wl_surface::WlSurface, Layer> for Desktop {
   fn event(
     state: &mut Self,
-    _: &wl_surface::WlSurface,
+    proxy: &wl_surface::WlSurface,
     event: wl_surface::Event,
     kind: &Layer,
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
     if let wl_surface::Event::PreferredBufferScale { factor } = event
-      && let Some(surface) = state.surface(*kind)
+      && let Some(surface) = state
+        .surface(*kind)
+        .filter(|surface| surface.surface == *proxy)
     {
       surface.scale = factor.clamp(1, 4);
       surface.dirty = true;
@@ -916,6 +961,12 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, Layer> for Desktop {
     _: &Connection,
     _: &QueueHandle<Self>,
   ) {
+    let Some(surface) = state
+      .surface(*kind)
+      .filter(|surface| surface.layer == *proxy)
+    else {
+      return;
+    };
     match event {
       zwlr_layer_surface_v1::Event::Configure {
         serial,
@@ -923,18 +974,16 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, Layer> for Desktop {
         height,
       } => {
         proxy.ack_configure(serial);
-        if let Some(surface) = state.surface(*kind) {
-          let (w, h) = surface.requested;
-          surface.configure = Some((
-            if width == 0 { w } else { width as i32 },
-            if height == 0 { h } else { height as i32 },
-          ));
-          surface.dirty = true;
-        }
+        let (w, h) = surface.requested;
+        surface.configure = Some((
+          if width == 0 { w } else { width as i32 },
+          if height == 0 { h } else { height as i32 },
+        ));
+        surface.dirty = true;
       }
       zwlr_layer_surface_v1::Event::Closed => match *kind {
-        Layer::Bar => state.closed = true,
-        Layer::Popup => state.popup = None,
+        Layer::Bar => state.close_bar(),
+        Layer::Popup => state.close_popup(),
         Layer::Corner(name, corner) => {
           state.corners.remove(&(name, corner));
         }
@@ -1075,10 +1124,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Desktop {
           }
         }
       }
-      Event::Enter { surface, .. } if surface.data::<Layer>() == Some(&Layer::Bar) => {
+      Event::Enter { surface, .. } if state.current(&surface) == Some(Layer::Bar) => {
         state.bar_keyboard_focus = true;
       }
-      Event::Leave { surface, .. } if surface.data::<Layer>() == Some(&Layer::Bar) => {
+      Event::Leave { surface, .. } if state.current(&surface) == Some(Layer::Bar) => {
         state.bar_keyboard_focus = false;
         state.repeated_key = None;
         state.actions.push(Action::BarFocusLost);
@@ -1202,7 +1251,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Desktop {
         surface_y,
         ..
       } => {
-        state.target = surface.data::<Layer>().copied();
+        state.target = state.current(&surface);
         state.xy = (surface_x, surface_y);
         if state.target == Some(Layer::Popup)
           && state.model.borrow_mut().hover_popup(Some(state.xy))
@@ -1219,7 +1268,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Desktop {
           }
         }
       }
-      Event::Leave { .. } => {
+      // Leaving a closed surface must not end hover on its replacement.
+      Event::Leave { surface, .. } if state.current(&surface) == state.target => {
         if state.target == Some(Layer::Bar) {
           let mut model = state.model.borrow_mut();
           if model.hover_bar(None)

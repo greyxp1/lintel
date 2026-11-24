@@ -1171,6 +1171,16 @@ impl Model {
     self.queue_drag = None;
   }
 
+  /// Forget pointer state tied to a bar surface the compositor closed and cancel its hide timers.
+  pub fn bar_closed(&mut self) {
+    self.hover_bar(None);
+    self.seek_preview = None;
+    self.queue_drag = None;
+    self.slider_preview = None;
+    self.pointer_generation = self.pointer_generation.wrapping_add(1);
+    self.bar_visible = self.panel != Panel::None;
+  }
+
   fn visible_list_rows(&self) -> usize {
     if self.panel == Panel::Music {
       match self.music_tab {
