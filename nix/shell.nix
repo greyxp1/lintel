@@ -3,6 +3,7 @@
   callPackage,
   curl,
   ffmpeg-headless,
+  gh,
   glib,
   lib,
   libxkbcommon,
@@ -15,6 +16,7 @@
   pkg-config,
   rustPlatform,
   writeShellScriptBin,
+  xdg-utils,
 }: let
   player = callPackage ./ytmd.nix {};
   python = python3.withPackages (ps: [ps.ytmusicapi]);
@@ -35,7 +37,7 @@ in
     nativeBuildInputs = [makeWrapper pkg-config];
     buildInputs = [cairo glib pango libxkbcommon];
     postFixup = ''
-      wrapProgram "$out/bin/lintel" --prefix PATH : "${lib.makeBinPath [curl ffmpeg-headless library player pipewire pulseaudio wireplumber]}"
+      wrapProgram "$out/bin/lintel" --prefix PATH : "${lib.makeBinPath [curl ffmpeg-headless gh library player pipewire pulseaudio wireplumber xdg-utils]}"
     '';
     meta.mainProgram = "lintel";
   }

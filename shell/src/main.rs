@@ -1,4 +1,5 @@
 mod audio;
+mod github;
 mod media;
 mod services;
 mod ui;
@@ -131,6 +132,7 @@ fn run() -> Result<()> {
   let target = display.clone();
   let refresh: Rc<dyn Fn()> = Rc::new(move || target.draw(true));
   let services = Services::connect(model.clone(), refresh.clone())?;
+  github::watch(services.clone());
   initialize_wallpaper_environment();
   for config in std::iter::once(wallpaper).chain(backdrop) {
     thread::Builder::new()

@@ -95,7 +95,7 @@ const AUDIO_BUTTON_X: i32 = AUDIO_NAME_X - 33;
 const AUDIO_DEVICES: [Device; 2] = [Device::Output, Device::Input];
 const APP_AUDIO_Y: i32 = 135;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Notice {
   pub id: u32,
   pub summary: String,

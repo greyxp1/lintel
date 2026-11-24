@@ -24,6 +24,7 @@ const PROPS: &str = "org.freedesktop.DBus.Properties";
 const SHELL: &str = "org.lintel.Shell";
 const SHELL_PATH: &str = "/org/lintel/Shell";
 const HISTORY_LIMIT: usize = 100;
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(5500);
 const TRAY_LIMIT: usize = 32;
 
 fn notification_image(hints: &HashMap<String, Variant>, icon: &str) -> Option<cairo::ImageSurface> {
@@ -151,8 +152,15 @@ pub struct Services {
   refresh: Rc<dyn Fn()>,
   next_id: Cell<u32>,
   expiry: RefCell<HashMap<u32, glib::SourceId>>,
+  local: RefCell<HashMap<u32, Local>>,
   items: RefCell<Vec<RegisteredItem>>,
   subscriptions: RefCell<Vec<gio::SignalSubscription>>,
+}
+
+/// A live notice produced inside Lintel, whose actions run a handler instead of D-Bus signals.
+struct Local {
+  key: String,
+  handler: Rc<dyn Fn(&str)>,
 }
 
 struct RegisteredItem {
@@ -213,6 +221,7 @@ impl Services {
       refresh,
       next_id: Cell::new(0),
       expiry: RefCell::default(),
+      local: RefCell::default(),
       items: RefCell::default(),
       subscriptions: RefCell::default(),
     });
@@ -275,7 +284,10 @@ impl Services {
             ("Lintel", "Lintel", env!("CARGO_PKG_VERSION"), "1.2").to_variant()
           }
           "CloseNotification" => {
-            service.close(args.child_get(0), 3);
+            let id = args.child_get(0);
+            if !service.local.borrow().contains_key(&id) {
+              service.close(id, 3);
+            }
             ().to_variant()
           }
           "Notify" => {
@@ -295,25 +307,15 @@ impl Services {
 
   fn notify(self: &Rc<Self>, args: &Variant) -> u32 {
     let requested = args.child_get::<u32>(1);
-    let mut model = self.model.borrow_mut();
-    let id = if requested != 0
-      && model
+    let replace = (requested != 0
+      && !self.local.borrow().contains_key(&requested)
+      && self
+        .model
+        .borrow()
         .notices
         .iter()
-        .any(|notice| notice.id == requested && notice.live)
-    {
-      requested
-    } else {
-      let id = self.next_id.get().wrapping_add(1).max(1);
-      self.next_id.set(id);
-      id
-    };
-    let mut evicted = None;
-    if let Some(index) = model.notices.iter().position(|notice| notice.id == id) {
-      model.notices.remove(index);
-    } else if model.notices.len() >= HISTORY_LIMIT {
-      evicted = model.notices.pop_back();
-    }
+        .any(|notice| notice.id == requested && notice.live))
+    .then_some(requested);
     let actions = args.child_get::<Vec<String>>(5);
     let mut actions = actions.into_iter();
     let actions = std::iter::from_fn(|| Some((actions.next()?, actions.next()?)))
@@ -321,11 +323,14 @@ impl Services {
       .map(|(key, label)| (key, label.chars().take(100).collect()))
       .collect();
     let hints = args.child_get::<HashMap<String, Variant>>(6);
-    let icon = notification_image(&hints, &args.child_get::<String>(2));
     let timeout = args.child_get::<i32>(7);
-    let duration = (timeout != 0)
-      .then(|| Duration::from_millis(if timeout < 0 { 5500 } else { timeout as u64 }));
-    let popup = !model.do_not_disturb;
+    let duration = (timeout != 0).then(|| {
+      if timeout < 0 {
+        DEFAULT_TIMEOUT
+      } else {
+        Duration::from_millis(timeout as u64)
+      }
+    });
     let text: String = args.child_get::<String>(4).chars().take(1024).collect();
     let (source, message) = text
       .split_once("\n\n")
@@ -333,32 +338,77 @@ impl Services {
       .map_or((None, text.as_str()), |(source, message)| {
         (Some(source.to_owned()), message)
       });
-    model.notices.push_front(Notice {
-      id,
+    let notice = Notice {
       summary: args.child_get::<String>(3).chars().take(256).collect(),
       body: message.split_whitespace().collect::<Vec<_>>().join(" "),
       source,
       actions,
-      live: true,
-      popup,
-      seen: false,
-      image: icon,
-      transient: popup
-        && hints
-          .get("transient")
-          .and_then(Variant::get)
-          .unwrap_or(false),
+      image: notification_image(&hints, &args.child_get::<String>(2)),
+      transient: hints
+        .get("transient")
+        .and_then(Variant::get)
+        .unwrap_or(false),
       resident: hints
         .get("resident")
         .and_then(Variant::get)
         .unwrap_or(false),
-      countdown: duration.map(Countdown::new),
+      ..Notice::default()
+    };
+    self.insert(replace, notice, duration)
+  }
+
+  /// Shows a notice from inside Lintel, replacing the live notice registered under the same key.
+  pub fn notify_local(
+    self: &Rc<Self>,
+    key: String,
+    notice: Notice,
+    handler: impl Fn(&str) + 'static,
+  ) -> u32 {
+    let replace = self
+      .local
+      .borrow()
+      .iter()
+      .find_map(|(id, local)| (local.key == key).then_some(*id));
+    let id = self.insert(replace, notice, Some(DEFAULT_TIMEOUT));
+    self.local.borrow_mut().insert(
+      id,
+      Local {
+        key,
+        handler: Rc::new(handler),
+      },
+    );
+    id
+  }
+
+  fn insert(
+    self: &Rc<Self>,
+    replace: Option<u32>,
+    mut notice: Notice,
+    duration: Option<Duration>,
+  ) -> u32 {
+    let mut model = self.model.borrow_mut();
+    let id = replace.unwrap_or_else(|| {
+      let id = self.next_id.get().wrapping_add(1).max(1);
+      self.next_id.set(id);
+      id
     });
+    let mut evicted = None;
+    if let Some(index) = model.notices.iter().position(|notice| notice.id == id) {
+      model.notices.remove(index);
+    } else if model.notices.len() >= HISTORY_LIMIT {
+      evicted = model.notices.pop_back();
+    }
+    notice.id = id;
+    notice.live = true;
+    notice.popup = !model.do_not_disturb;
+    notice.transient &= notice.popup;
+    notice.countdown = duration.map(Countdown::new);
+    model.notices.push_front(notice);
     drop(model);
     if let Some(old) = evicted {
       self.cancel_expiry(old.id);
       if old.live {
-        self.closed_signal(old.id, 4);
+        self.closed(old.id, 4);
       }
     }
     self.cancel_expiry(id);
@@ -436,7 +486,10 @@ impl Services {
     (self.refresh)();
   }
 
-  fn closed_signal(&self, id: u32, reason: u32) {
+  fn closed(&self, id: u32, reason: u32) {
+    if self.local.borrow_mut().remove(&id).is_some() {
+      return;
+    }
     let _ = self.bus.emit_signal(
       None,
       NOTIFY_PATH,
@@ -455,7 +508,7 @@ impl Services {
     for notice in model.notices.drain(..) {
       self.cancel_expiry(notice.id);
       if notice.live {
-        self.closed_signal(notice.id, 2);
+        self.closed(notice.id, 2);
       }
     }
     model.select(crate::ui::Panel::History);
@@ -474,7 +527,7 @@ impl Services {
     // Keep the sender's action available after the toast moves to history.
     if notice.live && (reason != 1 || notice.transient || notice.actions.is_empty()) {
       notice.live = false;
-      self.closed_signal(id, reason);
+      self.closed(id, reason);
     }
     if dismiss || notice.transient {
       model.notices.remove(index);
@@ -493,14 +546,27 @@ impl Services {
       notice.seen = true;
       let resident = notice.resident;
       drop(model);
-      let result = self.bus.emit_signal(
-        None,
-        NOTIFY_PATH,
-        NOTIFY,
-        "ActionInvoked",
-        Some(&(id, action).to_variant()),
-      );
-      if result.is_ok() && !resident {
+      let handler = self
+        .local
+        .borrow()
+        .get(&id)
+        .map(|local| local.handler.clone());
+      let delivered = if let Some(handler) = handler {
+        handler(action);
+        true
+      } else {
+        self
+          .bus
+          .emit_signal(
+            None,
+            NOTIFY_PATH,
+            NOTIFY,
+            "ActionInvoked",
+            Some(&(id, action).to_variant()),
+          )
+          .is_ok()
+      };
+      if delivered && !resident {
         self.finish_notice(id, 2, false);
       } else {
         (self.refresh)();

@@ -64,6 +64,7 @@ pub struct Bookmark {
   pub position: f64,
 }
 
+#[derive(Clone)]
 pub struct Art {
   pub data: Vec<u8>,
   pub width: i32,
