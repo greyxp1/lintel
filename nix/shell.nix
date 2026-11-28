@@ -5,6 +5,7 @@
   gh,
   glib,
   lib,
+  librsvg,
   libxkbcommon,
   makeWrapper,
   pango,
@@ -12,6 +13,8 @@
   pulseaudio,
   python3,
   wireplumber,
+  wl-clipboard,
+  wtype,
   pkg-config,
   rustPlatform,
   writeShellScriptBin,
@@ -29,9 +32,9 @@ in
     src = lib.cleanSource ../.;
     cargoLock.lockFile = ../Cargo.lock;
     nativeBuildInputs = [makeWrapper pkg-config];
-    buildInputs = [cairo glib pango libxkbcommon];
+    buildInputs = [cairo glib librsvg pango libxkbcommon];
     postFixup = ''
-      wrapProgram "$out/bin/lintel" --prefix PATH : "${lib.makeBinPath [curl gh library player pipewire pulseaudio wireplumber xdg-utils]}"
+      wrapProgram "$out/bin/lintel" --prefix PATH : "${lib.makeBinPath [curl gh library player pipewire pulseaudio wireplumber wl-clipboard wtype xdg-utils]}"
     '';
     meta.mainProgram = "lintel";
   }

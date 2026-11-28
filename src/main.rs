@@ -1,6 +1,7 @@
 mod audio;
 mod github;
 mod media;
+mod picker;
 mod services;
 mod ui;
 mod wayland;
@@ -28,7 +29,7 @@ Usage: lintel [OPTIONS]
        lintel music [LIBRARY ARGUMENTS]
        lintel toggle-audio
        lintel volume up|down
-       lintel toggle-picker NAMESPACE COMMAND [ARGS]
+       lintel picker apps|clipboard|passwords [--search QUERY]
 
 Options:
   --playlist NAME=ID     Pin a YouTube Music playlist (repeatable)
@@ -73,8 +74,15 @@ fn run() -> Result<()> {
     }
     return services::step_volume(step);
   }
-  if args.peek().is_some_and(|arg| arg == "toggle-picker") {
-    return toggle_picker(args.skip(1));
+  if args.peek().is_some_and(|arg| arg == "picker") {
+    let mode = args.nth(1).ok_or("expected apps, clipboard or passwords")?;
+    picker::Mode::parse(&mode).ok_or("expected apps, clipboard or passwords")?;
+    let search = match (args.next().as_deref(), args.next()) {
+      (None, _) => String::new(),
+      (Some("--search"), Some(search)) if args.next().is_none() => search,
+      _ => return Err("picker takes only --search QUERY".into()),
+    };
+    return services::toggle_picker(&mode, &search);
   }
   let mut pinned = Vec::new();
   while let Some(arg) = args.next() {
@@ -159,7 +167,9 @@ fn run() -> Result<()> {
   let audio_refresh = refresh.clone();
   let step_model = model.clone();
   let step_refresh = refresh.clone();
-  services.bind_audio_panel(
+  let pickers = picker::Controller::new(model.clone(), refresh.clone(), services.clone());
+  let toggle_picker = pickers.clone();
+  services.bind_shell(
     move || {
       let mut state = audio_model.borrow_mut();
       let open = state.panel != Panel::Audio;
@@ -173,6 +183,7 @@ fn run() -> Result<()> {
       }
     },
     move |step| queue_volume(&step_model, &step_refresh, AudioChange::OutputStep(step)),
+    move |mode, search| toggle_picker.toggle(mode, search),
   )?;
 
   let fd = display.desktop.borrow().fd();
@@ -735,6 +746,7 @@ fn run() -> Result<()> {
           Action::ClearNotifications => services.clear_notifications(),
           Action::Invoke(id, action) => services.invoke(id, &action),
           Action::Tray(address, method) => services.tray_action(&address, method),
+          Action::Picker(command) => pickers.run(command),
         }
       }
       display_events.draw(false);
@@ -764,67 +776,6 @@ fn run() -> Result<()> {
   let _ = router.send(Route::Stop);
   let _ = route_worker.join();
   display.failed.borrow_mut().take().map_or(Ok(()), Err)
-}
-
-fn toggle_picker(mut args: impl Iterator<Item = String>) -> Result<()> {
-  use rustix::event::{PollFd, PollFlags, Timespec, poll};
-  use rustix::io::Errno;
-  use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
-
-  let namespace = args.next().ok_or("missing picker namespace")?;
-  let program = args.next().ok_or("missing picker command")?;
-  let output = Command::new("niri")
-    .args(["msg", "--json", "layers"])
-    .output()?;
-  if !output.status.success() {
-    return Err("could not query Niri layers".into());
-  }
-  #[derive(serde::Deserialize)]
-  struct PickerLayer {
-    namespace: String,
-    pid: Option<i32>,
-  }
-  let layers: Vec<PickerLayer> = serde_json::from_slice(&output.stdout)?;
-  for layer in layers.into_iter().filter(|layer| {
-    matches!(
-      layer.namespace.as_str(),
-      "session-apps" | "session-clipboard"
-    ) || layer.namespace == namespace
-  }) {
-    let Some(pid) = layer.pid.and_then(Pid::from_raw) else {
-      continue;
-    };
-    let process = match pidfd_open(pid, PidfdFlags::empty()) {
-      Ok(process) => process,
-      Err(Errno::SRCH) => continue,
-      Err(error) => return Err(error.into()),
-    };
-    if !std::fs::read_link(format!("/proc/{}/exe", pid.as_raw_nonzero()))
-      .is_ok_and(|exe| exe.file_name().is_some_and(|name| name == "fuzzel"))
-    {
-      continue;
-    }
-    match pidfd_send_signal(&process, Signal::TERM) {
-      Ok(()) if layer.namespace == namespace => return Ok(()),
-      Ok(()) => {
-        // Fuzzel keeps its per-display lock until the process exits.
-        let mut wait = [PollFd::new(&process, PollFlags::IN)];
-        if poll(
-          &mut wait,
-          Some(&Timespec {
-            tv_sec: 1,
-            tv_nsec: 0,
-          }),
-        )? == 0
-        {
-          return Err("previous picker did not close".into());
-        }
-      }
-      Err(Errno::SRCH) => {}
-      Err(error) => return Err(error.into()),
-    }
-  }
-  Err(Command::new(program).args(args).exec().into())
 }
 
 async fn watch_tracks(
@@ -1150,7 +1101,7 @@ fn refresh_audio(model: &Rc<RefCell<Model>>, refresh: &Rc<dyn Fn()>) {
   );
 }
 
-fn background<T: Send + 'static>(
+pub(crate) fn background<T: Send + 'static>(
   work: impl FnOnce() -> T + Send + 'static,
   done: impl FnOnce(T) + 'static,
 ) {

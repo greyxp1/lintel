@@ -19,6 +19,7 @@ use wayland_protocols::ext::background_effect::v1::client::{
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
+use crate::picker;
 use crate::ui::{self, Action, HEIGHT, Layer, Model, POPUP_HEIGHT, POPUP_WIDTH, WIDTH};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -168,6 +169,7 @@ pub struct Desktop {
   effects: Option<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
   bar: Option<Surface>,
   popup: Option<Surface>,
+  picker: Option<Surface>,
   corners: HashMap<(u32, u8), Surface>,
   outputs: HashMap<u32, wl_output::WlOutput>,
   pointer: Option<wl_pointer::WlPointer>,
@@ -177,6 +179,7 @@ pub struct Desktop {
   repeated_key: Option<(u32, Instant)>,
   caret_tick: Option<Instant>,
   bar_keyboard_focus: bool,
+  picker_keyboard_focus: bool,
   bar_on_demand: bool,
   bar_overlay: bool,
   target: Option<Layer>,
@@ -205,6 +208,7 @@ impl Desktop {
       effects,
       bar: None,
       popup: None,
+      picker: None,
       corners: HashMap::new(),
       outputs: HashMap::new(),
       pointer: None,
@@ -214,6 +218,7 @@ impl Desktop {
       repeated_key: None,
       caret_tick: None,
       bar_keyboard_focus: false,
+      picker_keyboard_focus: false,
       bar_on_demand: false,
       bar_overlay: false,
       target: None,
@@ -262,12 +267,34 @@ impl Desktop {
     }
   }
 
+  fn close_picker(&mut self) {
+    if self.picker.take().is_some() {
+      // Typing into the focused window waits until the compositor has processed the unmap.
+      self.conn.display().sync(&self.qh, Unmapped);
+    }
+    self.picker_keyboard_focus = false;
+    self.repeated_key = None;
+    if self.target == Some(Layer::Picker) {
+      self.target = None;
+    }
+  }
+
+  fn hover_picker(&mut self) {
+    let pointer = (self.target == Some(Layer::Picker)).then_some(self.xy);
+    if self.model.borrow_mut().picker.hover(pointer)
+      && let Some(picker) = &mut self.picker
+    {
+      picker.dirty = true;
+    }
+  }
+
   // Events can still name a surface this client already replaced.
   fn current(&self, surface: &wl_surface::WlSurface) -> Option<Layer> {
     let kind = *surface.data::<Layer>()?;
     let current = match kind {
       Layer::Bar => self.bar.as_ref(),
       Layer::Popup => self.popup.as_ref(),
+      Layer::Picker => self.picker.as_ref(),
       Layer::Corner(name, corner) => self.corners.get(&(name, corner)),
     }?;
     (current.surface == *surface).then_some(kind)
@@ -297,6 +324,7 @@ impl Desktop {
         Level::Overlay,
         Anchor::Top | Anchor::Right,
       ),
+      Layer::Picker => ("lintel-picker", Level::Overlay, Anchor::empty()),
       Layer::Corner(_, corner) => {
         let vertical = if corner & 2 == 0 {
           Anchor::Top
@@ -319,6 +347,9 @@ impl Desktop {
     match kind {
       Layer::Bar => {}
       Layer::Popup => layer.set_margin(HEIGHT + 8, 16, 0, 0),
+      Layer::Picker => {
+        layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive)
+      }
       Layer::Corner(..) => {
         layer.set_exclusive_zone(-1);
         let region = self.compositor.create_region(&self.qh, ());
@@ -389,8 +420,8 @@ impl Desktop {
     if let Some(bar) = &mut self.bar {
       bar.dirty = true;
     }
-    if let Some(popup) = &mut self.popup {
-      popup.dirty = true;
+    for surface in [&mut self.popup, &mut self.picker].into_iter().flatten() {
+      surface.dirty = true;
     }
     self.draw_pending()
   }
@@ -423,6 +454,13 @@ impl Desktop {
       }
     } else if self.popup.is_some() {
       self.close_popup();
+    }
+    let picker = self.model.borrow().picker.visible();
+    if picker && self.picker.is_none() && !self.outputs.is_empty() {
+      let size = (picker::WIDTH, picker::HEIGHT);
+      self.picker = Some(self.create(Layer::Picker, size, None));
+    } else if !picker && self.picker.is_some() {
+      self.close_picker();
     }
     let model = self.model.borrow();
     if let Some(bar) = &mut self.bar {
@@ -469,15 +507,13 @@ impl Desktop {
         Layer::Bar,
       )?;
     }
-    if let Some(popup) = &mut self.popup {
-      Self::draw(
-        &self.shm,
-        &self.compositor,
-        &self.qh,
-        popup,
-        &model,
-        Layer::Popup,
-      )?;
+    for (surface, kind) in [
+      (&mut self.popup, Layer::Popup),
+      (&mut self.picker, Layer::Picker),
+    ] {
+      if let Some(surface) = surface {
+        Self::draw(&self.shm, &self.compositor, &self.qh, surface, &model, kind)?;
+      }
     }
     for (&(name, corner), surface) in &mut self.corners {
       Self::draw(
@@ -503,7 +539,9 @@ impl Desktop {
         }
       }
     } else {
-      self.repeated_key = None;
+      if !self.picker_keyboard_focus {
+        self.repeated_key = None;
+      }
       if self.caret_tick.take().is_some() {
         model.search_cursor_visible = false;
         if let Some(bar) = &mut self.bar {
@@ -531,7 +569,11 @@ impl Desktop {
       self.repeated_key = self
         .keyboard_repeat
         .map(|(_, interval)| (key, now + interval));
-      self.edit_search_key(key);
+      if self.picker_keyboard_focus {
+        self.picker_key(key);
+      } else {
+        self.edit_search_key(key);
+      }
     }
     if self.caret_tick.is_some_and(|deadline| deadline <= now) {
       self.caret_tick = Some(now + CARET_PERIOD);
@@ -540,6 +582,34 @@ impl Desktop {
       drop(model);
       self.repaint_bar(ui::BarRegion::Search);
     }
+  }
+
+  /// Returns whether holding the key should repeat it.
+  fn picker_key(&mut self, key: u32) -> bool {
+    use xkbcommon::xkb;
+    let Some(keyboard) = &self.keyboard_state else {
+      return false;
+    };
+    let code = xkb::Keycode::new(key + 8);
+    let sym = keyboard.key_get_one_sym(code).raw();
+    let text = keyboard.key_get_utf8(code);
+    let active = |name| keyboard.mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE);
+    let input = picker::Key {
+      sym,
+      text: &text,
+      ctrl: active(xkb::MOD_NAME_CTRL),
+      alt: active(xkb::MOD_NAME_ALT),
+    };
+    let repeats = keyboard.get_keymap().key_repeats(code) && sym != xkb::keysyms::KEY_Escape;
+    let (changed, command) = self.model.borrow_mut().picker.key(input);
+    if changed && let Some(surface) = &mut self.picker {
+      surface.dirty = true;
+    }
+    let navigation = matches!(command, None | Some(picker::Command::Thumbnails));
+    if let Some(command) = command {
+      self.actions.push(Action::Picker(command));
+    }
+    repeats && changed && navigation
   }
 
   fn edit_search_key(&mut self, key: u32) -> bool {
@@ -810,6 +880,10 @@ impl Desktop {
             )?;
           }
           surface.surface.set_input_region(Some(&region));
+        } else if kind == Layer::Picker {
+          cr.new_path();
+          ui::round(&cr, 0, 0, width, height, picker::RADIUS);
+          add_blur_rows(&cr, &region, width, 0, height, picker::RADIUS as i32)?;
         } else if visible_height > ui::REVEAL_HEIGHT {
           ui::bar_outline(&cr, outline_height, wide);
           add_blur_rows(
@@ -854,6 +928,7 @@ impl Desktop {
     match kind {
       Layer::Bar => self.bar.as_mut(),
       Layer::Popup => self.popup.as_mut(),
+      Layer::Picker => self.picker.as_mut(),
       Layer::Corner(name, corner) => self.corners.get_mut(&(name, corner)),
     }
   }
@@ -946,8 +1021,20 @@ impl Dispatch<wl_surface::WlSurface, Layer> for Desktop {
         .surface(*kind)
         .filter(|surface| surface.surface == *proxy)
     {
-      surface.scale = factor.clamp(1, 4);
+      let scale = factor.clamp(1, 4);
+      surface.scale = scale;
       surface.dirty = true;
+      // The bar scale only predicts the next picker, whose own surface scale always wins.
+      let tracked = match kind {
+        Layer::Picker => true,
+        Layer::Bar => state.picker.is_none(),
+        _ => false,
+      };
+      let mut model = state.model.borrow_mut();
+      if tracked && model.picker.scale != scale {
+        model.picker.scale = scale;
+        state.actions.push(Action::Picker(picker::Command::Scale));
+      }
     }
   }
 }
@@ -984,6 +1071,10 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, Layer> for Desktop {
       zwlr_layer_surface_v1::Event::Closed => match *kind {
         Layer::Bar => state.close_bar(),
         Layer::Popup => state.close_popup(),
+        Layer::Picker => {
+          state.close_picker();
+          state.model.borrow_mut().picker.close();
+        }
         Layer::Corner(name, corner) => {
           state.corners.remove(&(name, corner));
         }
@@ -1038,6 +1129,23 @@ impl Dispatch<wl_callback::WlCallback, Layer> for Desktop {
   }
 }
 
+struct Unmapped;
+
+impl Dispatch<wl_callback::WlCallback, Unmapped> for Desktop {
+  fn event(
+    state: &mut Self,
+    _: &wl_callback::WlCallback,
+    _: wl_callback::Event,
+    _: &Unmapped,
+    _: &Connection,
+    _: &QueueHandle<Self>,
+  ) {
+    state
+      .actions
+      .push(Action::Picker(picker::Command::Unmapped));
+  }
+}
+
 impl Dispatch<wl_buffer::WlBuffer, Layer> for Desktop {
   fn event(
     state: &mut Self,
@@ -1079,6 +1187,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for Desktop {
         keyboard.release();
         state.keyboard_state = None;
         state.bar_keyboard_focus = false;
+        state.picker_keyboard_focus = false;
       }
       if caps.contains(wl_seat::Capability::Pointer) {
         if state.pointer.is_none() {
@@ -1127,10 +1236,18 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Desktop {
       Event::Enter { surface, .. } if state.current(&surface) == Some(Layer::Bar) => {
         state.bar_keyboard_focus = true;
       }
+      Event::Enter { surface, .. } if state.current(&surface) == Some(Layer::Picker) => {
+        state.picker_keyboard_focus = true;
+      }
       Event::Leave { surface, .. } if state.current(&surface) == Some(Layer::Bar) => {
         state.bar_keyboard_focus = false;
         state.repeated_key = None;
         state.actions.push(Action::BarFocusLost);
+      }
+      Event::Leave { surface, .. } if state.current(&surface) == Some(Layer::Picker) => {
+        state.picker_keyboard_focus = false;
+        state.repeated_key = None;
+        state.model.borrow_mut().picker.close();
       }
       Event::RepeatInfo { rate, delay } => {
         state.keyboard_repeat = (rate > 0).then(|| {
@@ -1150,6 +1267,18 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Desktop {
       } => {
         if let Some(keyboard) = &mut state.keyboard_state {
           keyboard.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+        }
+      }
+      Event::Key {
+        key,
+        state: WEnum::Value(wl_keyboard::KeyState::Pressed),
+        ..
+      } if state.picker_keyboard_focus => {
+        state.repeated_key = None;
+        if state.picker_key(key) {
+          state.repeated_key = state
+            .keyboard_repeat
+            .map(|(delay, _)| (key, Instant::now() + delay));
         }
       }
       Event::Key {
@@ -1253,6 +1382,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Desktop {
       } => {
         state.target = state.current(&surface);
         state.xy = (surface_x, surface_y);
+        state.hover_picker();
         if state.target == Some(Layer::Popup)
           && state.model.borrow_mut().hover_popup(Some(state.xy))
         {
@@ -1286,6 +1416,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Desktop {
           state.actions.push(Action::PopupHover);
         }
         state.target = None;
+        state.hover_picker();
       }
       Event::Motion {
         surface_x,
@@ -1293,6 +1424,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Desktop {
         ..
       } => {
         state.xy = (surface_x, surface_y);
+        state.hover_picker();
         if state.target == Some(Layer::Popup)
           && state.model.borrow_mut().hover_popup(Some(state.xy))
         {
@@ -1313,6 +1445,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Desktop {
           if changed && let Some(bar) = &mut state.bar {
             bar.dirty = true;
           }
+        }
+      }
+      Event::Button {
+        button,
+        state: WEnum::Value(wl_pointer::ButtonState::Pressed),
+        ..
+      } if state.target == Some(Layer::Picker) => {
+        let (x, y) = state.xy;
+        if button == 0x110
+          && let Some(command) = state.model.borrow_mut().picker.click(x, y)
+        {
+          state.actions.push(Action::Picker(command));
+        }
+        if let Some(picker) = &mut state.picker {
+          picker.dirty = true;
         }
       }
       Event::Button {
@@ -1349,6 +1496,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Desktop {
           && let Some(bar) = &mut state.bar
         {
           bar.dirty = true;
+        }
+      }
+      Event::Axis {
+        axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
+        value,
+        ..
+      } if state.target == Some(Layer::Picker) => {
+        if state.model.borrow_mut().picker.scroll(value) {
+          state
+            .actions
+            .push(Action::Picker(picker::Command::Thumbnails));
+          state.hover_picker();
+          if let Some(picker) = &mut state.picker {
+            picker.dirty = true;
+          }
         }
       }
       Event::Axis {

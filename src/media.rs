@@ -1033,11 +1033,11 @@ pub fn decode_art(bytes: Vec<u8>, size: u32) -> Option<Art> {
   limits.max_image_height = Some(2048);
   limits.max_alloc = Some(20 << 20);
   reader.limits(limits);
-  Some(thumbnail_art(reader.decode().ok()?, size))
+  Some(thumbnail_art(reader.decode().ok()?, size, size))
 }
 
-pub fn thumbnail_art(image: image::DynamicImage, size: u32) -> Art {
-  let pixels = image.thumbnail(size, size).into_rgba8();
+pub fn thumbnail_art(image: image::DynamicImage, width: u32, height: u32) -> Art {
+  let pixels = image.thumbnail(width, height).into_rgba8();
   let (width, height) = (pixels.width() as i32, pixels.height() as i32);
   let mut data = pixels.into_raw();
   for px in data.chunks_exact_mut(4) {

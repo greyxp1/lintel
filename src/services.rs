@@ -11,6 +11,7 @@ use gio::prelude::AppInfoExt;
 use gio::{Cancellable, DBusCallFlags, DBusConnection, DBusNodeInfo, DBusSignalFlags};
 
 use crate::media::Art;
+use crate::picker::Mode;
 use crate::ui::{Address, Countdown, Model, Notice, TrayItem, app_icon, image};
 
 const NOTIFY: &str = "org.freedesktop.Notifications";
@@ -107,7 +108,7 @@ fn notification_pixels(raw: &Variant) -> Option<cairo::ImageSurface> {
     let px = &data[start..start + channels];
     ::image::Rgba([px[0], px[1], px[2], if alpha { px[3] } else { 255 }])
   });
-  image(crate::media::thumbnail_art(pixels.into(), 48))
+  image(crate::media::thumbnail_art(pixels.into(), 48, 48))
 }
 
 const NOTIFY_XML: &str = r#"
@@ -194,6 +195,10 @@ pub fn step_volume(step: i32) -> Result<()> {
   shell_call("StepVolume", Some(&(step,).to_variant()))
 }
 
+pub fn toggle_picker(mode: &str, search: &str) -> Result<()> {
+  shell_call("TogglePicker", Some(&(mode, search).to_variant()))
+}
+
 fn shell_call(method: &str, args: Option<&Variant>) -> Result<()> {
   let bus = gio::bus_get_sync(gio::BusType::Session, None::<&Cancellable>)?;
   bus.call_sync(
@@ -230,14 +235,18 @@ impl Services {
     Ok(services)
   }
 
-  pub fn bind_audio_panel(
+  pub fn bind_shell(
     &self,
     toggle: impl Fn() + 'static,
     step: impl Fn(i32) + 'static,
+    picker: impl Fn(Mode, &str) + 'static,
   ) -> Result<()> {
     claim(&self.bus, SHELL)?;
     let interface = DBusNodeInfo::for_xml(
-      "<node><interface name='org.lintel.Shell'><method name='ToggleAudio'/>+      <method name='StepVolume'><arg type='i' direction='in'/></method></interface></node>",
+      "<node><interface name='org.lintel.Shell'><method name='ToggleAudio'/>\
+      <method name='StepVolume'><arg type='i' direction='in'/></method>\
+      <method name='TogglePicker'><arg type='s' direction='in'/>\
+      <arg type='s' direction='in'/></method></interface></node>",
     )?
     .lookup_interface(SHELL)
     .expect("shell interface");
@@ -257,6 +266,17 @@ impl Services {
               return;
             }
             step(amount);
+          }
+          "TogglePicker" => {
+            let (name, search) = args.get::<(String, String)>().unwrap_or_default();
+            let Some(mode) = Mode::parse(&name) else {
+              invocation.return_dbus_error(
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                "Expected apps, clipboard or passwords",
+              );
+              return;
+            };
+            picker(mode, &search);
           }
           _ => {
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method);

@@ -183,6 +183,7 @@ pub enum Panel {
 pub enum Layer {
   Bar,
   Popup,
+  Picker,
   Corner(u32, u8),
 }
 
@@ -356,6 +357,7 @@ pub enum Action {
   PopupHover,
   Invoke(u32, String),
   Tray(Address, &'static str),
+  Picker(crate::picker::Command),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -518,6 +520,7 @@ pub struct Model {
   pub audio_error: Option<String>,
   pub large_cover: Option<(String, Option<ImageSurface>)>,
   pub cover_accent: Option<u32>,
+  pub picker: crate::picker::Picker,
   offset: usize,
 }
 
@@ -1907,7 +1910,7 @@ pub fn image(art: Art) -> Option<ImageSurface> {
   .ok()
 }
 
-fn color(cr: &Context, rgb: u32, alpha: f64) {
+pub(crate) fn color(cr: &Context, rgb: u32, alpha: f64) {
   cr.set_source_rgba(
     f64::from(rgb >> 16 & 255) / 255.0,
     f64::from(rgb >> 8 & 255) / 255.0,
@@ -1927,7 +1930,7 @@ pub(crate) fn round(cr: &Context, x: i32, y: i32, w: i32, h: i32, radius: f64) {
   cr.close_path();
 }
 
-fn text_layout(cr: &Context, text: &str, size: i32, weight: Weight) -> pango::Layout {
+pub(crate) fn text_layout(cr: &Context, text: &str, size: i32, weight: Weight) -> pango::Layout {
   let layout = pangocairo::functions::create_layout(cr);
   let mut font = FontDescription::new();
   font.set_family("sans-serif");
@@ -1954,7 +1957,7 @@ thread_local! {
   static LABEL_LAYOUTS: RefCell<HashMap<LabelKey, pango::Layout>> = RefCell::default();
 }
 
-fn label(
+pub(crate) fn label(
   cr: &Context,
   text: &str,
   rect: (i32, i32, i32),
@@ -1965,7 +1968,7 @@ fn label(
   label_lines(cr, text, rect, size, weight, align, 1);
 }
 
-fn label_lines(
+pub(crate) fn label_lines(
   cr: &Context,
   text: &str,
   rect: (i32, i32, i32),
@@ -2024,7 +2027,7 @@ fn label_lines(
   });
 }
 
-fn picture(
+pub(crate) fn picture(
   cr: &Context,
   picture: Option<&ImageSurface>,
   x: i32,
@@ -2402,7 +2405,7 @@ fn player_title(cr: &Context, model: &Model) -> cairo::Result<()> {
   cr.restore()
 }
 
-fn search_symbol(cr: &Context, x: i32, y: i32) -> cairo::Result<()> {
+pub(crate) fn search_symbol(cr: &Context, x: i32, y: i32) -> cairo::Result<()> {
   let (x, y) = (f64::from(x), f64::from(y));
   cr.set_line_width(1.45);
   cr.new_sub_path();
@@ -3709,6 +3712,9 @@ pub fn paint(cr: &Context, model: &Model, layer: Layer) -> cairo::Result<()> {
   color(cr, 0, 0.0);
   cr.paint()?;
   cr.set_operator(Operator::Over);
+  if layer == Layer::Picker {
+    return crate::picker::paint(cr, &model.picker, model.opacity);
+  }
   if layer == Layer::Popup {
     let pointer = model.popup_at_pointer();
     for (row, (notice, y)) in model.popups().zip(model.popup_rows()).enumerate() {
